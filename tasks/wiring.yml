@@ -1,0 +1,32 @@
+---
+# Copyright (C) 2026 Robert Wimmer
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Read configuration and identity resources
+  kubernetes.core.k8s_info:
+    api_version: "{{ item.apiVersion }}"
+    kind: "{{ item.kind }}"
+    name: "{{ item.metadata.name }}"
+    namespace: "{{ item.metadata.namespace | default(omit) }}"
+  loop: "{{ coredns__health_manifest | selectattr('kind', 'in', ['ConfigMap', 'ServiceAccount', 'ClusterRole', 'ClusterRoleBinding', 'PodDisruptionBudget']) | list }}"
+  loop_control:
+    label: "{{ item.kind }}/{{ item.metadata.name }}"
+  register: coredns__wiring
+  no_log: true
+
+- name: Check configuration and identity against release manifests
+  ansible.builtin.assert:
+    that:
+      - item.resources | length == 1
+      - item.item.kind != 'ConfigMap' or item.resources[0].data == item.item.data
+      - item.item.kind != 'ClusterRole' or item.resources[0].rules == item.item.rules
+      - item.item.kind != 'ClusterRoleBinding' or item.resources[0].subjects == item.item.subjects
+      - item.item.kind != 'ClusterRoleBinding' or item.resources[0].roleRef == item.item.roleRef
+      - item.item.kind != 'PodDisruptionBudget' or item.resources[0].spec.selector == item.item.spec.selector
+      - item.item.kind != 'PodDisruptionBudget' or item.resources[0].spec.get('minAvailable') == item.item.spec.get('minAvailable')
+      - item.item.kind != 'PodDisruptionBudget' or item.resources[0].spec.get('maxUnavailable') == item.item.spec.get('maxUnavailable')
+    fail_msg: Chart-owned configuration, RBAC, or disruption protection is missing or differs from the release.
+  loop: "{{ coredns__wiring.results }}"
+  loop_control:
+    label: "{{ item.item.kind }}/{{ item.item.metadata.name }}"
+  no_log: true

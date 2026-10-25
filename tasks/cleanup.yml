@@ -1,0 +1,32 @@
+---
+# Copyright (C) 2026 Robert Wimmer
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Clean resources created by this execution
+  when: not ansible_check_mode
+  block:
+    - name: Remove candidate release
+      when: coredns__candidate_owned | default(false)
+      kubernetes.core.helm:
+        release_name: "{{ coredns__candidate_name }}"
+        release_namespace: "{{ coredns_namespace }}"
+        release_state: absent
+        wait: true
+        timeout: "{{ coredns_timeout }}s"
+
+    - name: Remove temporary DNS client
+      when: coredns__client_owned | default(false)
+      kubernetes.core.k8s:
+        api_version: v1
+        kind: Pod
+        name: "{{ coredns_release_name }}-preflight-client"
+        namespace: "{{ coredns_namespace }}"
+        state: absent
+        wait: true
+        wait_timeout: "{{ coredns_timeout }}"
+  rescue:
+    - name: Report cleanup failure and any original rollout failure
+      ansible.builtin.fail:
+        msg: >-
+          CoreDNS temporary-resource cleanup failed: {{ ansible_failed_result.msg | default(ansible_failed_result | string) }}.
+          Original rollout failure: {{ coredns__original_failure | default('none') }}.

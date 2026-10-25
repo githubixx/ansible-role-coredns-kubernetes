@@ -1,0 +1,45 @@
+---
+# Copyright (C) 2026 Robert Wimmer
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Gather bounded failure evidence
+  block:
+    - name: Read namespace pod conditions
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Pod
+        namespace: "{{ coredns_namespace }}"
+        label_selectors:
+          - "app.kubernetes.io/instance={{ coredns_release_name }}"
+      register: coredns__diagnostic_pods
+
+    - name: Report pod conditions without credentials
+      ansible.builtin.debug:
+        msg:
+          name: "{{ item.metadata.name }}"
+          phase: "{{ item.status.phase }}"
+          conditions: "{{ item.status.conditions | default([]) }}"
+          containers: "{{ item.status.containerStatuses | default([]) }}"
+      loop: "{{ coredns__diagnostic_pods.resources }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+
+    - name: Read recent CoreDNS logs
+      kubernetes.core.k8s_log:
+        name: "{{ item.metadata.name }}"
+        namespace: "{{ coredns_namespace }}"
+        container: coredns
+        tail_lines: 30
+      loop: "{{ coredns__diagnostic_pods.resources }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+      register: coredns__diagnostic_logs
+      no_log: true
+
+    - name: Report location of protected log evidence
+      ansible.builtin.debug:
+        msg: Bounded CoreDNS logs were gathered in coredns__diagnostic_logs (not printed because custom plugins can log sensitive data).
+  rescue:
+    - name: Report evidence collection failure without masking rollout failure
+      ansible.builtin.debug:
+        msg: "Could not collect all CoreDNS diagnostics: {{ ansible_failed_result.msg | default('API/log access failed') }}."

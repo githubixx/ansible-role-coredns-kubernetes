@@ -1,0 +1,161 @@
+---
+# Copyright (C) 2026 Robert Wimmer
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Select deployed health contract
+  ansible.builtin.set_fact:
+    coredns__health_deployment: "{{ coredns__health_manifest | selectattr('kind', 'equalto', 'Deployment') | first }}"
+    coredns__health_dns_services: []
+
+- name: Select Services exposing DNS
+  when: item.spec.ports | selectattr('port', 'equalto', 53) | list | length > 0
+  ansible.builtin.set_fact:
+    coredns__health_dns_services: "{{ coredns__health_dns_services + [item] }}"
+  loop: "{{ coredns__health_manifest | selectattr('kind', 'equalto', 'Service') | list }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+
+- name: Require one DNS Service
+  ansible.builtin.assert:
+    that: coredns__health_dns_services | length == 1
+    fail_msg: Expected exactly one DNS Service in the deployed release.
+
+- name: Select DNS Service
+  ansible.builtin.set_fact:
+    coredns__health_service: "{{ coredns__health_dns_services | first }}"
+
+- name: Wait for full Deployment convergence
+  kubernetes.core.k8s_info:
+    api_version: apps/v1
+    kind: Deployment
+    name: "{{ coredns__health_deployment.metadata.name }}"
+    namespace: "{{ coredns_namespace }}"
+  register: coredns__health_workload
+  until:
+    - coredns__health_workload.resources | length == 1
+    - coredns__health_workload.resources[0].status.observedGeneration | default(0) | int >= coredns__health_workload.resources[0].metadata.generation | int
+    - coredns__health_workload.resources[0].status.updatedReplicas | default(0) | int == coredns__health_deployment.spec.replicas | int
+    - coredns__health_workload.resources[0].status.readyReplicas | default(0) | int == coredns__health_deployment.spec.replicas | int
+    - coredns__health_workload.resources[0].status.availableReplicas | default(0) | int == coredns__health_deployment.spec.replicas | int
+    - coredns__health_workload.resources[0].status.replicas | default(0) | int == coredns__health_deployment.spec.replicas | int
+  retries: "{{ [1, (coredns_timeout | int / 5) | round(0, 'ceil') | int] | max }}"
+  delay: 5
+
+- name: Require the intended workload image configuration and identity
+  ansible.builtin.assert:
+    that:
+      - coredns__health_workload.resources[0].spec.selector == coredns__health_deployment.spec.selector
+      - coredns__health_workload.resources[0].spec.template.spec.serviceAccountName == coredns__health_deployment.spec.template.spec.serviceAccountName
+      - coredns__health_workload.resources[0].spec.template.metadata.annotations['checksum/config'] == coredns__health_deployment.spec.template.metadata.annotations['checksum/config']
+      - >-
+        (coredns__health_workload.resources[0].spec.template.spec.containers | selectattr('name', 'equalto', 'coredns') | first).image
+        == coredns__health_deployment.spec.template.spec.containers[0].image
+      - >-
+        (coredns__health_workload.resources[0].spec.template.spec.containers | selectattr('name', 'equalto', 'coredns') | first).args
+        == coredns__health_deployment.spec.template.spec.containers[0].args
+    fail_msg: Live workload identity, image, arguments, or configuration checksum drifted from the release.
+
+- name: Initialize workload selectors
+  ansible.builtin.set_fact:
+    coredns__health_selectors: []
+
+- name: Derive selectors from the deployed workload
+  ansible.builtin.set_fact:
+    coredns__health_selectors: "{{ coredns__health_selectors + [item.key ~ '=' ~ item.value] }}"
+  loop: "{{ coredns__health_deployment.spec.selector.matchLabels | dict2items }}"
+
+- name: Wait for old pods to drain
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: "{{ coredns_namespace }}"
+    label_selectors: "{{ coredns__health_selectors }}"
+  register: coredns__health_pods
+  until:
+    - coredns__health_pods.resources | length == coredns__health_deployment.spec.replicas | int
+    - coredns__health_pods.resources | selectattr('metadata.deletionTimestamp', 'defined') | list | length == 0
+  retries: "{{ [1, (coredns_timeout | int / 5) | round(0, 'ceil') | int] | max }}"
+  delay: 5
+
+- name: Require only ready nonterminating DNS pods
+  ansible.builtin.assert:
+    that:
+      - coredns__health_pods.resources | length == coredns__health_deployment.spec.replicas | int
+      - item.metadata.deletionTimestamp is not defined
+      - item.status.phase == 'Running'
+      - item.status.conditions | selectattr('type', 'equalto', 'Ready') | map(attribute='status') | list == ['True']
+      - item.status.containerStatuses | map(attribute='ready') | unique | list == [true]
+      - item.metadata.annotations['checksum/config'] == coredns__health_deployment.spec.template.metadata.annotations['checksum/config']
+    fail_msg: "DNS pod {{ item.metadata.name }} is not a ready instance of the expected configuration."
+  loop: "{{ coredns__health_pods.resources }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+
+- name: Read DNS Service
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Service
+    namespace: "{{ coredns_namespace }}"
+    name: "{{ coredns__health_service.metadata.name }}"
+  register: coredns__health_service_info
+
+- name: Require exact DNS Service identity
+  ansible.builtin.assert:
+    that:
+      - coredns__health_service_info.resources | length == 1
+      - coredns__health_service.spec.clusterIP | default(coredns__health_service_info.resources[0].spec.clusterIP, true) == coredns__health_service_info.resources[0].spec.clusterIP
+      - coredns__health_service_info.resources[0].spec.selector == coredns__health_service.spec.selector
+      - coredns__health_service_info.resources[0].spec.ports | selectattr('port', 'equalto', 53) | map(attribute='protocol') | sort | list == ['TCP', 'UDP']
+    fail_msg: DNS Service address, selectors, or ports differ from the intended release.
+
+- name: Wait for DNS EndpointSlices
+  kubernetes.core.k8s_info:
+    api_version: discovery.k8s.io/v1
+    kind: EndpointSlice
+    namespace: "{{ coredns_namespace }}"
+    label_selectors:
+      - "kubernetes.io/service-name={{ coredns__health_service.metadata.name }}"
+  register: coredns__health_slices
+  until: >-
+    coredns__health_slices.resources | map(attribute='endpoints') | flatten
+    | selectattr('conditions.ready', 'equalto', true) | list | length >= coredns__health_deployment.spec.replicas | int
+  retries: "{{ [1, (coredns_timeout | int / 5) | round(0, 'ceil') | int] | max }}"
+  delay: 5
+
+- name: Require endpoints to belong to the expected pods
+  ansible.builtin.assert:
+    that:
+      - >-
+        coredns__health_slices.resources | map(attribute='endpoints') | flatten
+        | map(attribute='targetRef.uid') | unique | difference(coredns__health_pods.resources | map(attribute='metadata.uid') | list) | length == 0
+      - >-
+        coredns__health_slices.resources | map(attribute='ports') | flatten
+        | selectattr('port', 'equalto', 53) | map(attribute='protocol') | unique | sort | list == ['TCP', 'UDP']
+    fail_msg: DNS endpoints include foreign pods or missing UDP/TCP ports.
+
+- name: Check chart-owned configuration and RBAC
+  ansible.builtin.include_tasks: wiring.yml
+
+- name: Require deployed Helm status
+  kubernetes.core.helm_info:
+    release_name: "{{ coredns__health_deployment.spec.template.metadata.labels['app.kubernetes.io/instance'] }}"
+    release_namespace: "{{ coredns_namespace }}"
+  register: coredns__health_release
+
+- name: Assert release readiness
+  ansible.builtin.assert:
+    that:
+      - coredns__health_release.status is defined
+      - coredns__health_release.status.status | lower == 'deployed'
+    fail_msg: Helm does not report a deployed release.
+
+- name: Verify DNS behavior
+  when: coredns__probe | default(coredns_probe_pod) | length > 0
+  ansible.builtin.include_tasks: dns.yml
+  vars:
+    coredns__dns_address: "{{ coredns__health_service_info.resources[0].spec.clusterIP }}"
+
+- name: Report verification boundary
+  when: coredns__probe | default(coredns_probe_pod) | length == 0
+  ansible.builtin.debug:
+    msg: Kubernetes rollout readiness verified; functional DNS checks were not enabled.

@@ -1,0 +1,120 @@
+---
+# Copyright (C) 2026 Robert Wimmer
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Discover the expected API Service answer
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Service
+    namespace: default
+    name: kubernetes
+  register: coredns_test_sampling_api
+
+- name: Sample both transports throughout the public upgrade operation
+  block:
+    - name: Start a bounded continuous sampler on each worker
+      kubernetes.core.k8s:
+        state: present
+        wait: true
+        wait_timeout: 120
+        definition:
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: "rollout-{{ item }}"
+            namespace: coredns-tests
+          spec:
+            nodeName: "{{ item }}"
+            restartPolicy: Never
+            activeDeadlineSeconds: 1800
+            automountServiceAccountToken: false
+            terminationGracePeriodSeconds: 1
+            securityContext:
+              runAsNonRoot: true
+              runAsUser: 65532
+              runAsGroup: 65532
+              fsGroup: 65532
+              seccompProfile:
+                type: RuntimeDefault
+            containers:
+              - name: sampler
+                image: registry.k8s.io/e2e-test-images/agnhost:2.39
+                command:
+                  - /bin/sh
+                  - -ec
+                  - |
+                    while [ ! -f /tmp/stop ]; do
+                      for transport in +notcp +tcp; do
+                        answer="$(dig +time=1 +tries=1 +short +ignore "$transport" \
+                          @{{ coredns_service_ip }} kubernetes.default.svc.cluster.local. A)"
+                        test "$answer" = "{{ coredns_test_sampling_api.resources[0].spec.clusterIP }}"
+                      done
+                      printf '.\n' >> /tmp/samples
+                      sleep 1
+                    done
+                    wc -l < /tmp/samples
+                securityContext:
+                  allowPrivilegeEscalation: false
+                  readOnlyRootFilesystem: true
+                  capabilities:
+                    drop: [ALL]
+                resources:
+                  requests:
+                    cpu: 10m
+                    memory: 16Mi
+                  limits:
+                    memory: 64Mi
+                volumeMounts:
+                  - name: scratch
+                    mountPath: /tmp
+            volumes:
+              - name: scratch
+                emptyDir:
+                  sizeLimit: 1Mi
+      loop: [coredns-worker1, coredns-worker2]
+
+    - name: Require successful UDP and TCP samples before upgrading
+      kubernetes.core.k8s_exec:
+        namespace: coredns-tests
+        pod: "rollout-{{ item }}"
+        command: test -s /tmp/samples
+      register: coredns_test_sampling_started
+      changed_when: false
+      until: coredns_test_sampling_started.return_code == 0
+      retries: 10
+      delay: 1
+      loop: [coredns-worker1, coredns-worker2]
+
+    - name: Execute the upgrade while both samplers remain active
+      ansible.builtin.include_tasks: exercise.yml
+
+    - name: End sampling only after the upgrade and its checks return
+      kubernetes.core.k8s_exec:
+        namespace: coredns-tests
+        pod: "rollout-{{ item }}"
+        command: touch /tmp/stop
+      changed_when: false
+      loop: [coredns-worker1, coredns-worker2]
+
+    - name: Require every continuous DNS sample to have succeeded
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Pod
+        namespace: coredns-tests
+        name: "rollout-{{ item }}"
+      register: coredns_test_sampling_finished
+      until: coredns_test_sampling_finished.resources[0].status.phase == 'Succeeded'
+      retries: 10
+      delay: 1
+      loop: [coredns-worker1, coredns-worker2]
+  always:
+    - name: Remove only this exercise's sampler pods
+      kubernetes.core.k8s:
+        state: absent
+        api_version: v1
+        kind: Pod
+        namespace: coredns-tests
+        name: "rollout-{{ item }}"
+        wait: true
+        wait_timeout: 30
+      loop: [coredns-worker1, coredns-worker2]

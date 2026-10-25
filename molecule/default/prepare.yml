@@ -1,0 +1,259 @@
+---
+# Copyright (C) 2026 Robert Wimmer
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Prepare isolated guests
+  hosts: all
+  become: true
+  gather_facts: true
+  any_errors_fatal: true
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+  tasks:
+    - name: Prevent scheduled APT jobs in disposable guests
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        state: stopped
+        enabled: false
+        masked: true
+      loop:
+        - apt-daily.timer
+        - apt-daily-upgrade.timer
+
+    - name: Prevent new automatic APT jobs and wait for existing jobs to finish
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        masked: true
+      loop:
+        - apt-daily.service
+        - apt-daily-upgrade.service
+      register: coredns_test_apt_job
+      until: >-
+        coredns_test_apt_job is failed
+        or coredns_test_apt_job.status.ActiveState in ['inactive', 'failed']
+      retries: 120
+      delay: 5
+
+    - name: Preserve conventional temporary-directory permissions in fixture guests
+      ansible.builtin.file:
+        path: /tmp
+        state: directory
+        owner: root
+        group: root
+        mode: "1777"
+
+    - name: Bound package-mirror retries in disposable guests
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/80-coredns-molecule
+        mode: "0644"
+        content: |
+          Acquire::Languages "none";
+          Acquire::Retries "1";
+          Acquire::http::Timeout "20";
+          Acquire::https::Timeout "20";
+
+    - name: Refresh guest package indexes
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+        update_cache_retries: 2
+        update_cache_retry_max_delay: 10
+
+    - name: Install WireGuard
+      ansible.builtin.include_role:
+        name: githubixx.ansible_role_wireguard
+
+- name: Prepare certificates and tools
+  hosts: k8s_assets
+  become: true
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+  tasks:
+    - name: Install cfssl
+      ansible.builtin.include_role:
+        name: githubixx.cfssl
+
+    - name: Generate cluster certificates
+      ansible.builtin.include_role:
+        name: githubixx.kubernetes_ca
+
+    - name: Fetch scenario certificates to the controller
+      ansible.posix.synchronize:
+        mode: pull
+        src: "{{ k8s_ca_conf_directory }}/"
+        dest: "{{ k8s_ctl_ca_conf_directory }}/"
+
+    - name: Install execution-host dependencies
+      ansible.builtin.package:
+        name: [python3-yaml, python3-cryptography, conntrack, git]
+        state: present
+
+    - name: Bootstrap an isolated supported Kubernetes SDK
+      become: false
+      tags: coredns_sdk
+      block:
+        - name: Require the scenario's supported guest architecture
+          ansible.builtin.assert:
+            that: ansible_facts.architecture == 'x86_64'
+            fail_msg: This Vagrant scenario currently packages uv for Linux x86_64 guests only.
+
+        - name: Create guest-local SDK tool directories
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: directory
+            mode: "0755"
+          loop: ["~/.cache/coredns-molecule", "~/.local/share/coredns-molecule"]
+
+        - name: Download checksum-pinned standalone uv for the disposable guest
+          ansible.builtin.get_url:
+            url: https://github.com/astral-sh/uv/releases/download/0.9.4/uv-x86_64-unknown-linux-gnu.tar.gz
+            dest: ~/.cache/coredns-molecule/uv-0.9.4.tar.gz
+            checksum: sha256:e02f7fc102d6a1ebfa3b260b788e9adf35802be28c8d85640e83246e61519c1e
+            mode: "0644"
+
+        - name: Extract guest-local uv without modifying shared tooling
+          ansible.builtin.unarchive:
+            src: ~/.cache/coredns-molecule/uv-0.9.4.tar.gz
+            dest: ~/.local/share/coredns-molecule
+            remote_src: true
+            extra_opts: [--strip-components=1]
+            creates: ~/.local/share/coredns-molecule/uv
+
+        - name: Create the guest SDK environment with uv
+          ansible.builtin.command:
+            argv: [.local/share/coredns-molecule/uv, venv, --python, /usr/bin/python3, "{{ coredns_test_sdk_directory }}"]
+            chdir: /home/vagrant
+            creates: "{{ coredns_test_sdk_directory }}/bin/python"
+
+        - name: Install supported guest SDK dependencies with uv
+          ansible.builtin.command:
+            argv:
+              - .local/share/coredns-molecule/uv
+              - pip
+              - install
+              - --python
+              - "{{ coredns_test_sdk_directory }}/bin/python"
+              - kubernetes==35.0.0
+              - PyYAML
+              - jsonpatch
+              - cryptography
+            chdir: /home/vagrant
+          register: coredns_test_sdk_install
+          changed_when: "'Installed ' in coredns_test_sdk_install.stderr or 'Uninstalled ' in coredns_test_sdk_install.stderr"
+
+    - name: Install Helm
+      ansible.builtin.include_role:
+        name: gantsign.helm
+
+    - name: Install Kubernetes client for dependency roles
+      ansible.builtin.include_role:
+        name: githubixx.kubectl
+
+    - name: Create execution user's kubeconfig directory
+      ansible.builtin.file:
+        path: "{{ k8s_admin_conf_dir }}"
+        state: directory
+        owner: vagrant
+        group: vagrant
+        mode: "0700"
+
+    - name: Install pinned diff plugin for the execution user
+      become: false
+      kubernetes.core.helm_plugin:
+        plugin_path: https://github.com/databus23/helm-diff
+        plugin_version: v3.14.0
+        state: present
+
+- name: Prepare etcd
+  hosts: k8s_etcd
+  become: true
+  roles:
+    - githubixx.etcd
+  post_tasks:
+    - name: Load fixture etcd certificates after interrupted preparation
+      ansible.builtin.service:
+        name: etcd
+        state: restarted
+
+- name: Prepare API load balancing
+  hosts: haproxy
+  become: true
+  roles:
+    - githubixx.haproxy
+
+- name: Prepare container runtime
+  hosts: k8s_worker
+  become: true
+  roles:
+    - githubixx.runc
+    - githubixx.cni
+    - githubixx.containerd
+
+- name: Prepare control plane
+  hosts: k8s_controller
+  become: true
+  roles:
+    - githubixx.kubernetes_controller
+
+- name: Prepare workers
+  hosts: k8s_worker
+  become: true
+  roles:
+    - githubixx.kubernetes_worker
+
+- name: Restrict fixture admin credentials
+  hosts: k8s_assets
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Restrict admin kubeconfig to its execution user
+      ansible.builtin.file:
+        path: "{{ coredns_kubeconfig }}"
+        owner: vagrant
+        group: vagrant
+        mode: "0600"
+
+    - name: Make the admin kubeconfig discoverable by kubectl
+      ansible.builtin.file:
+        src: "{{ coredns_kubeconfig }}"
+        path: "{{ k8s_admin_conf_dir }}/config"
+        state: link
+        owner: vagrant
+        group: vagrant
+
+- name: Prepare pod networking before deploying role-managed CoreDNS
+  hosts: k8s_assets
+  become: false
+  environment:
+    K8S_AUTH_KUBECONFIG: "{{ coredns_kubeconfig }}"
+  tasks:
+    - name: Install Cilium dependency
+      ansible.builtin.include_role:
+        name: githubixx.cilium_kubernetes
+      vars:
+        cilium_action: install
+
+    - name: Wait for every Cilium agent
+      kubernetes.core.k8s_info:
+        api_version: apps/v1
+        kind: DaemonSet
+        namespace: cilium
+        name: cilium
+      register: coredns_test_cilium
+      until:
+        - coredns_test_cilium.resources | length == 1
+        - coredns_test_cilium.resources[0].status.numberReady | default(0) | int == groups.k8s_worker | length
+      retries: 120
+      delay: 5
+
+    - name: Keep test workloads off controllers
+      kubernetes.core.k8s_taint:
+        name: "{{ item }}"
+        state: present
+        taints:
+          - key: node-role.kubernetes.io/control-plane
+            effect: NoSchedule
+      loop: "{{ groups.k8s_controller }}"
+
+    - name: Create deterministic verification fixtures
+      ansible.builtin.include_tasks: tasks/fixtures.yml

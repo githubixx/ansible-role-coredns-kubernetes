@@ -1,0 +1,250 @@
+---
+# Copyright (C) 2026 Robert Wimmer
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Exercise public lifecycle tags in a disposable cluster
+  hosts: k8s_assets
+  gather_facts: false
+  become: false
+  vars:
+    coredns_test_inventory: "{{ ansible_inventory_sources | first }}"
+    coredns_test_root: "{{ lookup('ansible.builtin.env', 'MOLECULE_PROJECT_DIRECTORY') }}"
+    coredns_test_command:
+      - ansible-playbook
+      - -i
+      - "{{ coredns_test_inventory }}"
+      - "{{ playbook_dir }}/operation.yml"
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: "{{ coredns_kubeconfig }}"
+    group/kubernetes.core.helm:
+      kubeconfig: "{{ coredns_kubeconfig }}"
+  tasks:
+    - name: Read starting release and retained revision
+      kubernetes.core.helm_info:
+        release_name: coredns
+        release_namespace: kube-system
+      register: coredns_test_start
+
+    - name: Exercise successful configuration upgrade with preflight
+      ansible.builtin.include_tasks:
+        file: tasks/rollout.yml
+        apply:
+          tags: coredns_rollout
+      tags: coredns_rollout
+      vars:
+        coredns_test_case:
+          name: upgrade
+          tags: coredns_present
+          success: true
+          extra:
+            coredns_preflight: true
+            coredns_probe_pod: ""
+            coredns_values_template: "{{ playbook_dir }}/templates/exercise-values.yml.j2"
+            coredns_test_variant: upgrade
+
+    - name: Exercise explicit revision rollback
+      ansible.builtin.include_tasks: tasks/exercise.yml
+      vars:
+        coredns_test_case:
+          name: explicit-rollback
+          tags: coredns_rollback
+          success: true
+          extra:
+            coredns_rollback_revision: "{{ coredns_test_start.status.revision | int }}"
+
+    - name: Exercise non-mutating check mode for each lifecycle entry point
+      ansible.builtin.include_tasks: tasks/exercise.yml
+      loop: [coredns_present, coredns_template, coredns_rollback, coredns_absent]
+      loop_control:
+        loop_var: coredns_test_check_tag
+      vars:
+        coredns_test_case:
+          name: "check-{{ coredns_test_check_tag }}"
+          tags: "{{ coredns_test_check_tag }}"
+          check: true
+          success: true
+          unchanged: true
+          same_revision: true
+          extra:
+            coredns_allow_removal: true
+            coredns_rollback_revision: "{{ coredns_test_start.status.revision | int }}"
+            coredns_template_path: /tmp/coredns-dry-run/template.yml
+
+    - name: Exercise missing diff plugin without changing shared Helm state
+      ansible.builtin.include_tasks: tasks/exercise.yml
+      vars:
+        coredns_test_case:
+          name: missing-diff
+          tags: coredns_present
+          success: false
+          unchanged: true
+          same_revision: true
+          expected_message: Install a Helm-3-compatible helm-diff plugin
+          extra:
+            coredns_test_environment:
+              HELM_PLUGINS: /tmp/coredns-empty-plugin-directory
+
+    - name: Exercise candidate collision safeguards
+      ansible.builtin.include_tasks: tasks/collision.yml
+
+    - name: Exercise failed candidates and automatic recovery
+      ansible.builtin.include_tasks: tasks/exercise.yml
+      loop:
+        - {variant: invalid, preflight: true}
+        - {variant: invalid, preflight: false}
+        - {variant: semantic, preflight: false}
+      loop_control:
+        loop_var: coredns_test_failure
+      vars:
+        coredns_test_case:
+          name: "{{ coredns_test_failure.variant }}-preflight-{{ coredns_test_failure.preflight }}"
+          tags: coredns_present
+          success: false
+          unchanged: true
+          same_revision: "{{ coredns_test_failure.preflight }}"
+          expected_message: CoreDNS reconciliation failed
+          extra:
+            coredns_preflight: "{{ coredns_test_failure.preflight }}"
+            coredns_timeout: 90
+            coredns_values_template: "{{ playbook_dir }}/templates/exercise-values.yml.j2"
+            coredns_test_variant: "{{ coredns_test_failure.variant }}"
+
+    - name: Exercise authenticated DNS over TLS
+      ansible.builtin.include_tasks: tasks/exercise.yml
+      vars:
+        coredns_test_case:
+          name: dot
+          tags: coredns_present
+          success: true
+          extra:
+            coredns_preflight: true
+            coredns_values_template: "{{ playbook_dir }}/templates/exercise-values.yml.j2"
+            coredns_test_variant: dot
+
+    - name: Exercise TLS authentication failures before production mutation
+      ansible.builtin.include_tasks: tasks/exercise.yml
+      loop: [wrong-name, untrusted]
+      loop_control:
+        loop_var: coredns_test_tls_failure
+      vars:
+        coredns_test_case:
+          name: "{{ coredns_test_tls_failure }}"
+          tags: coredns_present
+          success: false
+          unchanged: true
+          same_revision: true
+          expected_message: CoreDNS reconciliation failed
+          extra:
+            coredns_preflight: true
+            coredns_values_template: "{{ playbook_dir }}/templates/exercise-values.yml.j2"
+            coredns_test_variant: "{{ coredns_test_tls_failure }}"
+
+    - name: Exercise invalid rollback before mutation
+      ansible.builtin.include_tasks: tasks/exercise.yml
+      vars:
+        coredns_test_case:
+          name: invalid-revision
+          tags: coredns_rollback
+          success: false
+          unchanged: true
+          same_revision: true
+          expected_message: is not a retained deployed/superseded revision
+          extra: {coredns_rollback_revision: 999999}
+
+    - name: Exercise multi-server imported and authoritative zone files
+      ansible.builtin.include_tasks: tasks/exercise.yml
+      vars:
+        coredns_test_case:
+          name: custom-zones
+          tags: coredns_present
+          success: true
+          extra:
+            coredns_preflight: true
+            coredns_values_template: "{{ coredns_test_root }}/examples/custom-zones.yml.j2"
+            coredns_forwarding_probes:
+              - {name: answer.example.test., type: A, expected: ["192.0.2.42"]}
+              - {name: static.internal.test., type: A, expected: ["192.0.2.7"]}
+
+    - name: Exercise all-tag selection without triggering nondefault operations
+      ansible.builtin.include_tasks: tasks/exercise.yml
+      vars:
+        coredns_test_case:
+          name: all-tags
+          tags: all
+          success: true
+          extra: {}
+
+    - name: Exercise guarded removal
+      ansible.builtin.include_tasks: tasks/exercise.yml
+      vars:
+        coredns_test_case:
+          name: guarded-removal
+          tags: coredns_absent
+          success: false
+          unchanged: true
+          same_revision: true
+          expected_message: Removing cluster DNS requires
+          extra: {}
+
+    - name: Exercise acknowledged removal
+      ansible.builtin.include_tasks:
+        file: tasks/exercise.yml
+        apply:
+          tags: coredns_reinstall
+      tags: coredns_reinstall
+      vars:
+        coredns_test_case:
+          name: acknowledged-removal
+          tags: coredns_absent
+          success: true
+          absent: true
+          extra: {coredns_allow_removal: true}
+
+    - name: Exercise atomic failure of a fresh installation
+      ansible.builtin.include_tasks:
+        file: tasks/exercise.yml
+        apply:
+          tags: coredns_reinstall
+      tags: coredns_reinstall
+      vars:
+        coredns_test_case:
+          name: fresh-install-failure
+          success: false
+          absent: true
+          expected_message: CoreDNS reconciliation failed
+          extra:
+            coredns_timeout: 90
+            coredns_values_template: "{{ playbook_dir }}/templates/exercise-values.yml.j2"
+            coredns_test_variant: invalid
+
+    - name: Exercise reinstall with ordinary execution
+      ansible.builtin.include_tasks:
+        file: tasks/exercise.yml
+        apply:
+          tags: coredns_reinstall
+      tags: coredns_reinstall
+      vars:
+        coredns_test_case:
+          name: reinstall
+          success: true
+          extra: {}
+
+    - name: Exercise retained-history and recovery-failure safeguards
+      ansible.builtin.include_tasks:
+        file: tasks/extended.yml
+        apply:
+          tags: coredns_extended
+      tags: coredns_extended
+
+    - name: Record the new baseline revision after lifecycle exercises
+      kubernetes.core.helm_info:
+        release_name: coredns
+        release_namespace: kube-system
+      register: coredns_test_final
+
+    - name: Save current baseline for read-only verification
+      ansible.builtin.copy:
+        dest: "{{ coredns_test_sdk_directory | dirname }}/baseline-revision"
+        content: "{{ coredns_test_final.status.revision }}"
+        mode: "0600"

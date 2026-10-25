@@ -1,0 +1,48 @@
+---
+# Copyright (C) 2026 Robert Wimmer
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Read retained release history
+  # A lower desired retention limit must not hide revisions that still exist.
+  ansible.builtin.command:
+    argv: >-
+      {{ coredns__cli + ['history', coredns_release_name, '--output', 'json', '--max',
+         ([coredns_history_max | int, coredns__release.status.revision | int] | max | string)] }}
+  changed_when: false
+  check_mode: false
+  register: coredns__history_result
+
+- name: Parse retained release history
+  ansible.builtin.set_fact:
+    coredns__history: "{{ coredns__history_result.stdout | from_json }}"
+
+- name: Require a retained successful target revision
+  ansible.builtin.assert:
+    that:
+      - coredns__target_revision | int > 0
+      - >-
+        coredns__history | selectattr('revision', 'equalto', coredns__target_revision | int)
+        | selectattr('status', 'in', ['deployed', 'superseded']) | list | length == 1
+    fail_msg: "Revision {{ coredns__target_revision }} is not a retained deployed/superseded revision."
+
+- name: Read the retained revision manifest
+  ansible.builtin.command:
+    argv: "{{ coredns__cli + ['get', 'manifest', coredns_release_name, '--revision', coredns__target_revision | string] }}"
+  changed_when: false
+  check_mode: false
+  register: coredns__target_manifest_result
+  no_log: true
+
+- name: Parse retained resource identities
+  ansible.builtin.set_fact:
+    coredns__target_manifest: "{{ coredns__target_manifest_result.stdout | from_yaml_all | select('mapping') | list }}"
+  no_log: true
+
+- name: Require a role-managed rollback target
+  ansible.builtin.assert:
+    that:
+      - coredns__target_manifest | selectattr('kind', 'equalto', 'Deployment') | list | length == 1
+      - >-
+        (coredns__target_manifest | selectattr('kind', 'equalto', 'Deployment') | first)
+        .metadata.get('annotations', {}).get('githubixx.github.io/coredns-role', '') == 'true'
+    fail_msg: Retained revision lacks this role's management marker; rollback adoption is unsupported.

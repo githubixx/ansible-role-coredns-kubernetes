@@ -1,0 +1,53 @@
+# Copyright (C) 2026 Robert Wimmer
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# Test-only Helm values used by "molecule side-effect" to exercise upgrades,
+# candidate preflight checks, TLS authentication, and recovery after failures.
+# Do not use this template for a real cluster: several variants deliberately
+# break DNS so the tests can check that the role detects and handles failures.
+#
+# The tests select this file through coredns_values_template and set
+# coredns_test_variant to choose the change:
+#   upgrade: reduce the cache TTL from 30 to 5 seconds for a valid upgrade.
+#   invalid: use a nonexistent plugin so CoreDNS cannot start.
+#   semantic: return 192.0.2.99 for answer.example.test instead of the expected
+#             192.0.2.42, testing a DNS failure even when pods are running.
+#   dot: forward over DNS-over-TLS to the local test upstream, trusting its
+#        certificate through the upstream-tls Secret mounted below.
+#   wrong-name: use a TLS server name that does not match that certificate.
+#   untrusted: omit the test CA from the forwarder's trusted certificates.
+#
+# Start with the role's built-in DNS configuration and change only the plugin
+# needed for each test. The result replaces the complete chart servers list;
+# settings such as replica count and resources are left unchanged.
+{% set ns = namespace(plugins=[]) %}
+{% for plugin in coredns__baseline.servers[0].plugins %}
+{% if plugin.name == 'cache' and coredns_test_variant == 'upgrade' %}
+{% set ns.plugins = ns.plugins + [plugin | combine({'parameters': '5'})] %}
+{% elif plugin.name == 'cache' and coredns_test_variant == 'invalid' %}
+{% set ns.plugins = ns.plugins + [plugin | combine({'name': 'not_a_real_plugin'})] %}
+{% elif plugin.name == 'forward' and coredns_test_variant in ['dot', 'wrong-name', 'untrusted'] %}
+{% set tls_block = 'tls_servername ' ~ ('wrong.example.test' if coredns_test_variant == 'wrong-name' else 'upstream.example.test') %}
+{% if coredns_test_variant != 'untrusted' %}
+{% set tls_block = tls_block ~ '\ntls /trust/tls.crt' %}
+{% endif %}
+{% set ns.plugins = ns.plugins + [plugin | combine({'parameters': '. tls://' ~ coredns_upstreams[0] ~ ':853', 'configBlock': tls_block})] %}
+{% else %}
+{% set ns.plugins = ns.plugins + [plugin] %}
+{% endif %}
+{% endfor %}
+{% if coredns_test_variant == 'semantic' %}
+{% set ns.plugins = [{'name': 'hosts', 'configBlock': '192.0.2.99 answer.example.test\nfallthrough'}] + ns.plugins %}
+{% endif %}
+{{ {'servers': [coredns__baseline.servers[0] | combine({'plugins': ns.plugins})]} | to_nice_yaml(indent=2) }}
+{% if coredns_test_variant in ['dot', 'wrong-name', 'untrusted'] %}
+extraVolumes:
+  - name: trust
+    secret:
+      secretName: upstream-tls
+      defaultMode: 292
+extraVolumeMounts:
+  - name: trust
+    mountPath: /trust
+    readOnly: true
+{% endif %}

@@ -1,0 +1,388 @@
+---
+# Copyright (C) 2026 Robert Wimmer
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Verify dependency services and listeners without changing guests
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Inspect guest temporary-directory integrity
+      ansible.builtin.stat:
+        path: /tmp
+      register: coredns_test_tmp
+
+    - name: Require conventional temporary-directory permissions
+      ansible.builtin.assert:
+        that:
+          - coredns_test_tmp.stat.isdir
+          - coredns_test_tmp.stat.mode == '1777'
+          - coredns_test_tmp.stat.uid == 0
+
+    - name: Read service states
+      ansible.builtin.service_facts:
+
+    - name: Verify control-plane services
+      when: inventory_hostname in groups.k8s_controller
+      ansible.builtin.assert:
+        that: ansible_facts.services[item].state == 'running'
+        fail_msg: "Dependency service {{ item }} is not running on {{ inventory_hostname }}."
+      loop: [kube-apiserver.service, kube-controller-manager.service, kube-scheduler.service]
+
+    - name: Verify etcd service
+      when: inventory_hostname in groups.k8s_etcd
+      ansible.builtin.assert:
+        that: ansible_facts.services['etcd.service'].state == 'running'
+
+    - name: Verify worker services
+      when: inventory_hostname in groups.k8s_worker
+      ansible.builtin.assert:
+        that: ansible_facts.services[item].state == 'running'
+      loop: [containerd.service, kubelet.service, kube-proxy.service]
+
+    - name: Verify secure API listener
+      when: inventory_hostname in groups.k8s_controller
+      ansible.builtin.wait_for:
+        host: "{{ wireguard_address.split('/')[0] }}"
+        port: 6443
+        timeout: 10
+
+    - name: Verify etcd listener
+      when: inventory_hostname in groups.k8s_etcd
+      ansible.builtin.wait_for:
+        host: "{{ wireguard_address.split('/')[0] }}"
+        port: 2379
+        timeout: 10
+
+- name: Verify Helm installation and DNS behavior without mutating the cluster
+  hosts: k8s_assets
+  become: false
+  gather_facts: false
+  vars:
+    coredns_test_clients: "{{ groups.k8s_worker | difference(groups.k8s_controller) | map('regex_replace', '^', 'client-') | list }}"
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: "{{ coredns_kubeconfig }}"
+    group/kubernetes.core.helm:
+      kubeconfig: "{{ coredns_kubeconfig }}"
+  tasks:
+    - name: Inspect admin kubeconfig integrity
+      ansible.builtin.stat:
+        path: "{{ coredns_kubeconfig }}"
+      register: coredns_test_kubeconfig
+
+    - name: Require a private nonempty admin kubeconfig
+      ansible.builtin.assert:
+        that:
+          - coredns_test_kubeconfig.stat.isreg
+          - coredns_test_kubeconfig.stat.size > 0
+          - coredns_test_kubeconfig.stat.mode in ['0400', '0600']
+
+    - name: Inspect kubectl's default kubeconfig path
+      ansible.builtin.stat:
+        path: "{{ k8s_admin_conf_dir }}/config"
+        follow: false
+      register: coredns_test_default_kubeconfig
+
+    - name: Require the default kubeconfig to point to the protected admin file
+      ansible.builtin.assert:
+        that:
+          - coredns_test_default_kubeconfig.stat.islnk
+          - coredns_test_default_kubeconfig.stat.lnk_source == coredns_kubeconfig
+
+    - name: List cluster nodes using kubectl's default kubeconfig discovery
+      ansible.builtin.command:
+        argv: [kubectl, get, nodes, --output=name]
+      environment:
+        KUBECONFIG: ""
+      changed_when: false
+      register: coredns_test_default_access
+
+    - name: Require default kubectl access to the expected cluster nodes
+      ansible.builtin.assert:
+        that:
+          - >-
+            coredns_test_default_access.stdout_lines | sort
+            == groups.k8s_worker | map('regex_replace', '^', 'node/') | sort
+
+    - name: Check authenticated API readiness
+      ansible.builtin.uri:
+        url: "https://{{ k8s_admin_api_endpoint_host }}:{{ k8s_admin_api_endpoint_port }}/readyz"
+        ca_path: "{{ k8s_ca_conf_directory }}/ca-k8s-apiserver.pem"
+        client_cert: "{{ k8s_ca_conf_directory }}/cert-admin.pem"
+        client_key: "{{ k8s_ca_conf_directory }}/cert-admin-key.pem"
+        return_content: true
+      register: coredns_test_api_health
+
+    - name: Require a healthy API response
+      ansible.builtin.assert:
+        that: coredns_test_api_health.content | trim == 'ok'
+
+    - name: Read node readiness
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Node
+      register: coredns_test_nodes
+
+    - name: Require every expected node ready
+      ansible.builtin.assert:
+        that:
+          - coredns_test_nodes.resources | length == groups.k8s_worker | length
+          - item.status.conditions | selectattr('type', 'equalto', 'Ready') | map(attribute='status') | list == ['True']
+      loop: "{{ coredns_test_nodes.resources }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+
+    - name: Read Cilium readiness
+      kubernetes.core.k8s_info:
+        api_version: apps/v1
+        kind: DaemonSet
+        name: cilium
+        namespace: cilium
+      register: coredns_test_cilium
+
+    - name: Require all Cilium agents
+      ansible.builtin.assert:
+        that:
+          - coredns_test_cilium.resources | length == 1
+          - coredns_test_cilium.resources[0].status.numberReady | int == groups.k8s_worker | length
+          - coredns_test_cilium.resources[0].status.numberUnavailable | default(0) | int == 0
+
+    - name: Read Helm release through admin kubeconfig
+      kubernetes.core.helm_info:
+        release_name: coredns
+        release_namespace: kube-system
+      register: coredns_test_release
+
+    - name: Read original converged revision
+      ansible.builtin.slurp:
+        src: "{{ coredns_test_sdk_directory | dirname }}/baseline-revision"
+      register: coredns_test_revision
+
+    - name: Assert exact versions and unchanged release history
+      ansible.builtin.assert:
+        that:
+          - coredns_test_release.status.chart == 'coredns-1.49.0'
+          - coredns_test_release.status.app_version == '1.14.7'
+          - coredns_test_release.status.status | lower == 'deployed'
+          - coredns_test_release.status.revision | string == coredns_test_revision.content | b64decode | trim
+
+    - name: Reuse read-only runtime health assertions
+      ansible.builtin.include_role:
+        name: githubixx.coredns
+        tasks_from: health
+      vars:
+        coredns__health_manifest: "{{ coredns_test_release.status.manifest }}"
+
+    - name: Read DNS deployment for safety assertions
+      kubernetes.core.k8s_info:
+        api_version: apps/v1
+        kind: Deployment
+        name: coredns
+        namespace: kube-system
+      register: coredns_test_deployment
+
+    - name: Assert default availability and container hardening
+      ansible.builtin.assert:
+        that:
+          - coredns_test_deployment.resources[0].spec.replicas == 2
+          - coredns_test_deployment.resources[0].spec.strategy.rollingUpdate.maxUnavailable == 0
+          - coredns_test_deployment.resources[0].spec.strategy.rollingUpdate.maxSurge == 1
+          - coredns_test_deployment.resources[0].spec.template.spec.priorityClassName == 'system-cluster-critical'
+          - coredns_test_deployment.resources[0].spec.template.spec.serviceAccountName == 'coredns'
+          - coredns_test_deployment.resources[0].spec.template.spec.containers[0].securityContext.runAsNonRoot
+          - coredns_test_deployment.resources[0].spec.template.spec.containers[0].securityContext.readOnlyRootFilesystem
+          - not coredns_test_deployment.resources[0].spec.template.spec.containers[0].securityContext.allowPrivilegeEscalation
+          - coredns_test_deployment.resources[0].spec.template.spec.containers[0].securityContext.capabilities.drop == ['ALL']
+          - coredns_test_deployment.resources[0].spec.template.spec.containers[0].resources.requests.cpu == '100m'
+          - coredns_test_deployment.resources[0].spec.template.spec.containers[0].image == 'coredns/coredns:1.14.7'
+
+    - name: Read disruption budget
+      kubernetes.core.k8s_info:
+        api_version: policy/v1
+        kind: PodDisruptionBudget
+        name: coredns
+        namespace: kube-system
+      register: coredns_test_pdb
+
+    - name: Assert disruption budget and selector
+      ansible.builtin.assert:
+        that:
+          - coredns_test_pdb.resources | length == 1
+          - coredns_test_pdb.resources[0].spec.minAvailable == 1
+          - coredns_test_pdb.resources[0].spec.selector.matchLabels['app.kubernetes.io/instance'] == 'coredns'
+
+    - name: Read DNS configuration
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: ConfigMap
+        namespace: kube-system
+        name: coredns
+      register: coredns_test_config
+
+    - name: Assert the expected Corefile plugins
+      ansible.builtin.assert:
+        that: item in coredns_test_config.resources[0].data.Corefile
+      loop:
+        - kubernetes cluster.local in-addr.arpa ip6.arpa
+        - lameduck 10s
+        - ready
+        - prometheus 0.0.0.0:9153
+        - cache 30
+        - loop
+        - reload
+        - loadbalance
+
+    - name: Read API and record fixture Services
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Service
+        namespace: "{{ item.namespace }}"
+        name: "{{ item.name }}"
+      loop:
+        - {name: kubernetes, namespace: default}
+        - {name: record, namespace: coredns-tests}
+      register: coredns_test_records
+
+    - name: Read DNS replica addresses
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Pod
+        namespace: kube-system
+        label_selectors: [app.kubernetes.io/instance=coredns, app.kubernetes.io/name=coredns]
+      register: coredns_test_pods
+
+    - name: Require actual node separation in the two-worker test topology
+      ansible.builtin.assert:
+        that: coredns_test_pods.resources | map(attribute='spec.nodeName') | unique | list | length == 2
+
+    - name: Build exact DNS answer checks
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Pod
+        namespace: coredns-tests
+        label_selectors: [app=dns-client]
+      register: coredns_test_client_pods
+
+    - name: Define exact DNS answer checks
+      ansible.builtin.set_fact:
+        coredns_test_checks:
+          - name: kubernetes.default.svc.cluster.local.
+            type: A
+            expected: "{{ coredns_test_records.results[0].resources[0].spec.clusterIP }}"
+          - name: record.coredns-tests.svc.cluster.local.
+            type: A
+            expected: "{{ coredns_test_records.results[1].resources[0].spec.clusterIP }}"
+          - name: _dns._tcp.record.coredns-tests.svc.cluster.local.
+            type: SRV
+            expected: "0 100 8053 record.coredns-tests.svc.cluster.local."
+          - name: "{{ coredns_test_records.results[1].resources[0].spec.clusterIP.split('.') | reverse | join('.') }}.in-addr.arpa."
+            type: PTR
+            expected: record.coredns-tests.svc.cluster.local.
+          - name: absent-record.coredns-tests.svc.cluster.local.
+            type: A
+            status: NXDOMAIN
+            expected: ""
+          - name: answer.example.test.
+            type: A
+            expected: "192.0.2.42"
+          - name: www.google.com.
+            type: A
+            valid_ipv4: true
+          - name: headless.coredns-tests.svc.cluster.local.
+            type: A
+            expected: "{{ coredns_test_client_pods.resources | map(attribute='status.podIP') | list }}"
+
+    - name: Query Service and every replica across both workers and transports
+      ansible.builtin.include_tasks: tasks/verify_query.yml
+      loop: >-
+        {{ coredns_test_checks | product(coredns_test_clients,
+           [coredns_service_ip] + (coredns_test_pods.resources | map(attribute='status.podIP') | list),
+           ['udp', 'tcp']) | list }}
+      loop_control:
+        loop_var: coredns_test_query
+        label: "{{ coredns_test_query[0].name }} / {{ coredns_test_query[1] }} / {{ coredns_test_query[2] }} / {{ coredns_test_query[3] }}"
+
+    - name: Verify normal pod resolver and search domains
+      kubernetes.core.k8s_exec:
+        namespace: coredns-tests
+        pod: "{{ item }}"
+        container: dns
+        command: dig +search record +noall +answer
+      changed_when: false
+      register: coredns_test_search
+      loop: "{{ coredns_test_clients }}"
+
+    - name: Assert search-domain answers
+      ansible.builtin.assert:
+        that: coredns_test_records.results[1].resources[0].spec.clusterIP in item.stdout.split()
+      loop: "{{ coredns_test_search.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Read HTTP endpoints from inside pod networking
+      kubernetes.core.k8s_exec:
+        namespace: coredns-tests
+        pod: "{{ coredns_test_clients[0] }}"
+        container: http
+        command: "wget -qO- -T 5 http://{{ item[0].status.podIP }}:{{ item[1].port }}/{{ item[1].path }}"
+      changed_when: false
+      loop: >-
+        {{ coredns_test_pods.resources | product([
+          {'port': 8080, 'path': 'health', 'answer': 'OK'},
+          {'port': 8181, 'path': 'ready', 'answer': 'OK'},
+          {'port': 9153, 'path': 'metrics', 'answer': 'coredns_build_info'}]) | list }}
+      loop_control:
+        label: "{{ item[0].metadata.name }}/{{ item[1].path }}"
+      register: coredns_test_http
+
+    - name: Assert HTTP health readiness and metrics bodies
+      ansible.builtin.assert:
+        that: item.item[1].answer in item.stdout
+      loop: "{{ coredns_test_http.results }}"
+      loop_control:
+        label: "{{ item.item[0].metadata.name }}/{{ item.item[1].path }}"
+
+    - name: Check candidate release leftovers
+      kubernetes.core.helm_info:
+        release_name: coredns-preflight
+        release_namespace: kube-system
+        release_state: all
+      register: coredns_test_candidate
+
+    - name: Check client leftovers
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Pod
+        name: coredns-preflight-client
+        namespace: kube-system
+      register: coredns_test_temporary_client
+
+    - name: Require complete temporary-resource cleanup
+      ansible.builtin.assert:
+        that:
+          - coredns_test_candidate.status is not defined
+          - coredns_test_temporary_client.resources | length == 0
+
+    - name: Inspect lifecycle sampler and admission-control leftovers
+      kubernetes.core.k8s_info:
+        api_version: "{{ item.api }}"
+        kind: "{{ item.kind }}"
+        name: "{{ item.name }}"
+        namespace: "{{ item.namespace | default(omit) }}"
+      loop:
+        - {api: v1, kind: Pod, name: rollout-coredns-worker1, namespace: coredns-tests}
+        - {api: v1, kind: Pod, name: rollout-coredns-worker2, namespace: coredns-tests}
+        - {api: admissionregistration.k8s.io/v1, kind: ValidatingAdmissionPolicyBinding, name: coredns-molecule-block-recovery}
+        - {api: admissionregistration.k8s.io/v1, kind: ValidatingAdmissionPolicy, name: coredns-molecule-block-recovery}
+      loop_control:
+        label: "{{ item.kind }}/{{ item.name }}"
+      register: coredns_test_exercise_leftovers
+
+    - name: Require cleanup of every lifecycle-only resource
+      ansible.builtin.assert:
+        that: item.resources | length == 0
+        fail_msg: "Lifecycle exercise left {{ item.item.kind }}/{{ item.item.name }} behind."
+      loop: "{{ coredns_test_exercise_leftovers.results }}"
+      loop_control:
+        label: "{{ item.item.kind }}/{{ item.item.name }}"

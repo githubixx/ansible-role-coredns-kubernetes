@@ -1,0 +1,47 @@
+---
+# Copyright (C) 2026 Robert Wimmer
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Require independent removal acknowledgement
+  ansible.builtin.assert:
+    that: coredns_allow_removal | bool
+    fail_msg: Removing cluster DNS requires coredns_allow_removal=true as well as --tags coredns_absent.
+
+- name: Inspect removal prerequisites and ownership
+  ansible.builtin.import_tasks: prerequisites.yml
+
+- name: Check live ownership before removal
+  when: coredns__release.status is defined
+  ansible.builtin.import_tasks: owned_resources.yml
+  vars:
+    coredns__ownership_manifest: "{{ coredns__release.status.manifest }}"
+
+- name: Remove only the owned Helm release
+  kubernetes.core.helm:
+    release_name: "{{ coredns_release_name }}"
+    release_namespace: "{{ coredns_namespace }}"
+    release_state: absent
+    wait: true
+    timeout: "{{ coredns_timeout }}s"
+
+- name: Inspect removed release resources
+  when:
+    - not ansible_check_mode
+    - coredns__release.status is defined
+  kubernetes.core.k8s_info:
+    api_version: "{{ item.apiVersion }}"
+    kind: "{{ item.kind }}"
+    name: "{{ item.metadata.name }}"
+    namespace: "{{ item.metadata.namespace | default(omit) }}"
+  loop: "{{ coredns__release.status.manifest | default([]) }}"
+  loop_control:
+    label: "{{ item.kind }}/{{ item.metadata.name }}"
+  register: coredns__removed_resources
+
+- name: Require complete resource removal
+  when:
+    - not ansible_check_mode
+    - coredns__release.status is defined
+  ansible.builtin.assert:
+    that: coredns__removed_resources.results | map(attribute='resources') | flatten | length == 0
+    fail_msg: Helm uninstalled the release but some managed resources remain; inspect them before reinstalling.

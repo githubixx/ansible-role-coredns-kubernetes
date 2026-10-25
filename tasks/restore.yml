@@ -1,0 +1,33 @@
+---
+# Copyright (C) 2026 Robert Wimmer
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Validate rollback target
+  ansible.builtin.import_tasks: history.yml
+
+- name: Check ownership of resources reintroduced by rollback
+  ansible.builtin.import_tasks: owned_resources.yml
+  vars:
+    coredns__ownership_manifest: "{{ coredns__target_manifest }}"
+
+- name: Restore retained Helm revision
+  when: not ansible_check_mode
+  ansible.builtin.command:
+    argv: >-
+      {{ coredns__cli + ['rollback', coredns_release_name, coredns__target_revision | string,
+                         '--wait', '--timeout', (coredns_timeout | string) ~ 's',
+                         '--history-max', coredns_history_max | string] }}
+  changed_when: true
+
+- name: Fetch restored release
+  when: not ansible_check_mode
+  kubernetes.core.helm_info:
+    release_name: "{{ coredns_release_name }}"
+    release_namespace: "{{ coredns_namespace }}"
+  register: coredns__restored
+
+- name: Verify restored release rather than rejected candidate
+  when: not ansible_check_mode
+  ansible.builtin.include_tasks: health.yml
+  vars:
+    coredns__health_manifest: "{{ coredns__restored.status.manifest }}"

@@ -1,0 +1,27 @@
+---
+# Copyright (C) 2026 Robert Wimmer
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Read authoritative expected Kubernetes address
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Service
+    name: kubernetes
+    namespace: default
+  register: coredns__api_service
+
+- name: Select the deployed Kubernetes DNS domain
+  ansible.builtin.set_fact:
+    coredns__dns_domain: "{{ coredns__health_deployment.metadata.annotations['githubixx.github.io/cluster-domain'] }}"
+
+- name: Run internal and opt-in forwarding checks over both transports
+  ansible.builtin.include_tasks: dns_query.yml
+  loop: >-
+    {{ ([{'name': 'kubernetes.default.svc.' ~ coredns__dns_domain ~ '.',
+           'type': ('AAAA' if ':' in coredns__api_service.resources[0].spec.clusterIP else 'A'),
+           'expected': [coredns__api_service.resources[0].spec.clusterIP]}]
+         + coredns__health_release.status.release_values.get('githubixxRole', {}).get('forwardingProbes', []))
+       | product(['udp', 'tcp']) | list }}
+  loop_control:
+    loop_var: coredns__query
+    label: "{{ coredns__query[0].name }} / {{ coredns__query[1] }}"

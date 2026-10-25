@@ -1,0 +1,34 @@
+---
+# Copyright (C) 2026 Robert Wimmer
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Query DNS with explicit server and transport
+  kubernetes.core.k8s_exec:
+    namespace: coredns-tests
+    pod: "{{ coredns_test_query[1] }}"
+    container: dns
+    command: >-
+      dig @{{ coredns_test_query[2] }} {{ coredns_test_query[0].name }}
+      {{ coredns_test_query[0].type }} +time=3 +tries=1
+      {{ '+tcp' if coredns_test_query[3] == 'tcp' else '+notcp +ignore' }}
+      +noall +comments +answer
+  changed_when: false
+  register: coredns_test_answer
+
+- name: Assert response code and answer data
+  vars:
+    coredns_test_answer_data: >-
+      {{ coredns_test_answer.stdout
+         | regex_findall('(?m)^\S+\s+\d+\s+IN\s+' ~ coredns_test_query[0].type ~ '\s+(.+)$')
+         | map('regex_replace', '\s+', ' ') | sort | list }}
+  ansible.builtin.assert:
+    that:
+      - "('status: ' ~ (coredns_test_query[0].status | default('NOERROR')) ~ ',') in coredns_test_answer.stdout"
+      - >-
+        (coredns_test_answer_data | length > 0
+         and coredns_test_answer_data | select('ansible.utils.ipv4_address') | list | length == coredns_test_answer_data | length)
+        if coredns_test_query[0].valid_ipv4 | default(false)
+        else (coredns_test_answer_data
+              == (([coredns_test_query[0].expected] if coredns_test_query[0].expected is string else coredns_test_query[0].expected) | sort
+                  if coredns_test_query[0].expected | length else []))
+    fail_msg: "{{ coredns_test_query }} returned {{ coredns_test_answer.stdout }}"

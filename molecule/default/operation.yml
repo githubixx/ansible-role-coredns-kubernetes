@@ -1,0 +1,42 @@
+---
+# Copyright (C) 2026 Robert Wimmer
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# Test helper, not a standard Molecule entry point. Molecule does not run this
+# file automatically. During "molecule side-effect", side_effect.yml and its
+# exercise tasks launch this playbook through a separate ansible-playbook process
+# for each operation, supplying lifecycle tags, extra variables, and optionally
+# --check. This tests the same command-line interface a role user would invoke.
+#
+# Each process has its own tag selection and exit status. The surrounding tests
+# check that successful operations work and deliberately broken ones fail for
+# the expected reason, then inspect the resulting release and DNS behavior.
+#
+# Deployments and rendering use the scenario's test upstream DNS Service.
+# Rollback and removal skip that lookup because they do not need new DNS values.
+# coredns_test_environment optionally supplies process environment settings for
+# individual cases, such as testing with an empty Helm plugin directory.
+- name: Exercise the public native tag interface
+  hosts: k8s_assets
+  gather_facts: false
+  become: false
+  environment: "{{ coredns_test_environment | default({}) }}"
+  pre_tasks:
+    - name: Discover fixture upstream for deployment operations
+      when: ansible_run_tags | intersect(['coredns_rollback', 'coredns_absent']) | length == 0
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ coredns_kubeconfig }}"
+        api_version: v1
+        kind: Service
+        name: upstream
+        namespace: coredns-tests
+      register: coredns_test_operation_upstream
+      tags: always
+
+    - name: Select upstream address
+      when: ansible_run_tags | intersect(['coredns_rollback', 'coredns_absent']) | length == 0
+      ansible.builtin.set_fact:
+        coredns_upstreams: ["{{ coredns_test_operation_upstream.resources[0].spec.clusterIP }}"]
+      tags: always
+  roles:
+    - githubixx.coredns

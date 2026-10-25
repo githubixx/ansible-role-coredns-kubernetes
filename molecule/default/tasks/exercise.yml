@@ -1,0 +1,72 @@
+---
+# Copyright (C) 2026 Robert Wimmer
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Capture pre-exercise release configuration
+  kubernetes.core.helm_info:
+    release_name: coredns
+    release_namespace: kube-system
+  register: coredns_test_before
+
+- name: Execute native lifecycle entry point {{ coredns_test_case.name }}
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+  environment:
+    ANSIBLE_ROLES_PATH: "{{ lookup('ansible.builtin.config', 'DEFAULT_ROLES_PATH') | join(':') }}"
+    ANSIBLE_COLLECTIONS_PATH: "{{ lookup('ansible.builtin.config', 'COLLECTIONS_PATHS') | join(':') }}"
+  ansible.builtin.command:
+    argv: >-
+      {{ coredns_test_command
+         + (['--tags', coredns_test_case.tags] if coredns_test_case.tags is defined else [])
+         + (['--check'] if coredns_test_case.check | default(false) else [])
+         + ['--extra-vars', coredns_test_case.extra | to_json] }}
+  changed_when: false
+  failed_when: false
+  register: coredns_test_execution
+  no_log: true
+
+- name: Assert the exercise exit status
+  ansible.builtin.assert:
+    that:
+      - (coredns_test_execution.rc == 0) == coredns_test_case.success
+      - coredns_test_case.expected_message | default('') in (coredns_test_execution.stdout ~ coredns_test_execution.stderr)
+    fail_msg: "{{ coredns_test_case.name }}: {{ (coredns_test_execution.stdout ~ '\n' ~ coredns_test_execution.stderr)[-6000:] }}"
+
+- name: Inspect release after exercise
+  kubernetes.core.helm_info:
+    release_name: coredns
+    release_namespace: kube-system
+    release_state: all
+  register: coredns_test_after
+
+- name: Assert acknowledged absence or a deployed release
+  ansible.builtin.assert:
+    that:
+      - (coredns_test_after.status is not defined) if coredns_test_case.absent | default(false) else (coredns_test_after.status.status | lower == coredns_test_case.expected_status | default('deployed'))
+      - not coredns_test_case.unchanged | default(false) or coredns_test_before.status.manifest == coredns_test_after.status.manifest
+      - not coredns_test_case.same_revision | default(false) or coredns_test_before.status.revision == coredns_test_after.status.revision
+    fail_msg: "Exercise {{ coredns_test_case.name }} did not preserve the expected release configuration."
+
+- name: Check shared namespace still exists
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Namespace
+    name: kube-system
+  register: coredns_test_shared_namespace
+
+- name: Require preserved shared namespace
+  ansible.builtin.assert:
+    that: coredns_test_shared_namespace.resources | length == 1
+
+- name: Check candidate cleanup after every exercise
+  kubernetes.core.helm_info:
+    release_name: coredns-preflight
+    release_namespace: kube-system
+    release_state: all
+  register: coredns_test_leftover
+
+- name: Require no candidate release
+  ansible.builtin.assert:
+    that: coredns_test_leftover.status is not defined

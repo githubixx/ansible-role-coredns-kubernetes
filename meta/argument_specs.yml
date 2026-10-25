@@ -1,0 +1,97 @@
+---
+# Copyright (C) 2026 Robert Wimmer
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+argument_specs:
+  main:
+    short_description: Manage CoreDNS through native lifecycle tags.
+    options:
+      coredns_chart_version:
+        type: str
+        default: "1.49.0"
+        description: Explicit version of the official chart.
+      coredns_chart_repository:
+        type: str
+        description: Official chart repository or compatible mirror.
+      coredns_release_name:
+        type: str
+        description: Helm release name.
+      coredns_namespace:
+        type: str
+        description: Existing namespace for the release.
+      coredns_service_ip:
+        type: str
+        description: DNS Service IP matching kubelet clusterDNS; required for deployment/rendering.
+      coredns_cluster_domain:
+        type: str
+        description: Domain matching kubelet clusterDomain.
+      coredns_delegate_to:
+        type: str
+        description: Inventory host executing Helm and Kubernetes modules.
+      coredns_kubeconfig:
+        type: str
+        description: Kubeconfig path on the execution host.
+      coredns_context:
+        type: str
+        description: Optional kubeconfig context.
+      coredns_helm_binary:
+        type: str
+        description: Helm binary on the execution host.
+      coredns_timeout:
+        type: int
+        description: Maximum seconds for each bounded operation.
+      coredns_history_max:
+        type: int
+        description: Retained Helm revisions; at least three.
+      coredns_values_template:
+        type: str
+        description: Optional controller-side Jinja template yielding a values mapping.
+      coredns_values:
+        type: dict
+        description: Explicit chart overrides applied last; lists replace.
+      coredns_upstreams:
+        type: list
+        elements: str
+        description: Default upstream resolver addresses.
+      coredns_allow_reduced_availability:
+        type: bool
+        description: Acknowledge fewer than two replicas or nonzero rollout unavailability.
+      coredns_allow_removal:
+        type: bool
+        description: Separate acknowledgement required with coredns_absent.
+      coredns_rollback_revision:
+        type: int
+        description: Positive retained revision required with coredns_rollback.
+      coredns_template_path:
+        type: path
+        description: Manifest output path on the execution host.
+      coredns_preflight:
+        type: bool
+        description: Opt in to an isolated candidate release before changed deployments.
+      coredns_probe_pod:
+        type: str
+        description: Existing pod containing dig; empty disables probes unless preflight is enabled.
+      coredns_probe_namespace:
+        type: str
+        description: Namespace of the existing probe pod.
+      coredns_probe_container:
+        type: str
+        description: Optional existing probe container.
+      coredns_probe_image:
+        type: str
+        description: DNS-client image for temporary preflight probes.
+      coredns_forwarding_probes:
+        type: list
+        elements: dict
+        description: Opt-in DNS tests, each with name, type, and expected answer tokens.
+        options:
+          name:
+            type: str
+            required: true
+          type:
+            type: str
+            default: A
+          expected:
+            type: list
+            elements: str
+            required: true

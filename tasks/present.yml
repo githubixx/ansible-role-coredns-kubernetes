@@ -1,0 +1,179 @@
+---
+# Copyright (C) 2026 Robert Wimmer
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Resolve desired chart
+  ansible.builtin.import_tasks: values.yml
+
+- name: Validate deployment tooling and release
+  ansible.builtin.import_tasks: prerequisites.yml
+
+- name: Inspect Helm plugins
+  kubernetes.core.helm_plugin_info:
+    binary_path: "{{ coredns_helm_binary }}"
+    plugin_name: diff
+  register: coredns__plugins
+  changed_when: false
+
+- name: Require reliable change detection
+  ansible.builtin.assert:
+    that:
+      - coredns__plugins.plugin_list | length == 1
+      - coredns__plugins.plugin_list[0].version is version('3.9.12', '>=')
+    fail_msg: Install a Helm-3-compatible helm-diff plugin >=3.9.12 on the execution host. This role never installs plugins.
+
+- name: Require the target namespace
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Namespace
+    name: "{{ coredns_namespace }}"
+  register: coredns__namespace
+
+- name: Validate namespace availability
+  ansible.builtin.assert:
+    that:
+      - coredns__namespace.resources | length == 1
+      - coredns__namespace.resources[0].status.phase == 'Active'
+    fail_msg: Create the target namespace before deploying CoreDNS.
+
+- name: Inspect resource ownership
+  ansible.builtin.import_tasks: ownership.yml
+
+- name: Inspect worker readiness
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Node
+  register: coredns__nodes
+
+- name: Initialize ready-node selection
+  ansible.builtin.set_fact:
+    coredns__ready_nodes: []
+
+- name: Select ready schedulable nodes
+  when:
+    - not item.spec.unschedulable | default(false)
+    - item.status.conditions | selectattr('type', 'equalto', 'Ready') | map(attribute='status') | list == ['True']
+  ansible.builtin.set_fact:
+    coredns__ready_nodes: "{{ coredns__ready_nodes + [item.metadata.name] }}"
+  loop: "{{ coredns__nodes.resources }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+
+- name: Require at least one ready schedulable node
+  ansible.builtin.assert:
+    that: coredns__ready_nodes | length > 0
+    fail_msg: No ready schedulable node is available. Review taints, affinity, and surge capacity.
+
+- name: Compute prospective release change
+  kubernetes.core.helm:
+    release_name: "{{ coredns_release_name }}"
+    release_namespace: "{{ coredns_namespace }}"
+    chart_ref: coredns
+    chart_repo_url: "{{ coredns_chart_repository }}"
+    chart_version: "{{ coredns_chart_version }}"
+    release_values: "{{ coredns__values }}"
+    reset_values: true
+    force: false
+    # Explicit false also conflicts with history_max in the module argument validator.
+    replace: "{{ omit }}"
+    take_ownership: false
+    wait: true
+    atomic: true
+    timeout: "{{ coredns_timeout }}s"
+    history_max: "{{ coredns_history_max }}"
+  check_mode: true
+  register: coredns__prospective
+  no_log: true
+
+- name: Report dry-run intent
+  when: ansible_check_mode
+  ansible.builtin.debug:
+    msg: "Dry run: release would change={{ coredns__prospective.changed }}. No cluster mutations or rollback will be executed."
+
+- name: Apply changed release with recovery and cleanup
+  when: not ansible_check_mode
+  block:
+    - name: Record pre-upgrade state
+      ansible.builtin.set_fact:
+        coredns__previous: "{{ coredns__release.status | default({}) }}"
+        coredns__candidate_owned: false
+        coredns__client_owned: false
+        coredns__mutation_started: false
+        coredns__recovered: false
+        coredns__original_failure: ""
+        coredns__probe: "{{ coredns_probe_pod }}"
+        coredns__probe_namespace: "{{ coredns_probe_namespace }}"
+        coredns__probe_container: "{{ coredns_probe_container }}"
+      no_log: true
+
+    - name: Prepare preflight client before checking the recovery baseline
+      when:
+        - coredns_preflight | bool
+        - coredns__prospective.changed
+        - coredns_probe_pod | length == 0
+      ansible.builtin.include_tasks: probe_client.yml
+
+    - name: Check the existing deployment before upgrading
+      when:
+        - coredns__previous | length > 0
+        - coredns__prospective.changed
+      ansible.builtin.include_tasks: health.yml
+      vars:
+        coredns__health_manifest: "{{ coredns__previous.manifest }}"
+
+    - name: Test isolated candidate before production mutation
+      when:
+        - coredns_preflight | bool
+        - coredns__prospective.changed
+      ansible.builtin.include_tasks: preflight.yml
+
+    - name: Mark production mutation boundary
+      ansible.builtin.set_fact:
+        coredns__mutation_started: "{{ coredns__prospective.changed }}"
+
+    - name: Reconcile chart atomically
+      kubernetes.core.helm:
+        release_name: "{{ coredns_release_name }}"
+        release_namespace: "{{ coredns_namespace }}"
+        chart_ref: coredns
+        chart_repo_url: "{{ coredns_chart_repository }}"
+        chart_version: "{{ coredns_chart_version }}"
+        release_values: "{{ coredns__values }}"
+        reset_values: true
+        force: false
+        replace: "{{ omit }}"
+        take_ownership: false
+        wait: true
+        atomic: true
+        timeout: "{{ coredns_timeout }}s"
+        history_max: "{{ coredns_history_max }}"
+      no_log: true
+
+    - name: Check production deployment
+      ansible.builtin.include_tasks: health.yml
+      vars:
+        coredns__health_manifest: "{{ coredns__manifest }}"
+
+  rescue:
+    - name: Preserve original failure
+      ansible.builtin.set_fact:
+        coredns__original_failure: "{{ ansible_failed_result.msg | default(ansible_failed_result | string) }}"
+
+    - name: Capture rollout evidence
+      ansible.builtin.include_tasks: diagnostics.yml
+
+    - name: Restore pre-upgrade release if production was touched
+      when:
+        - coredns__mutation_started | default(false)
+        - coredns__previous | default({}) | length > 0
+      ansible.builtin.include_tasks: recover.yml
+
+    - name: Report failed rollout even after recovery
+      ansible.builtin.fail:
+        msg: >-
+          CoreDNS reconciliation failed: {{ coredns__original_failure }}.
+          {{ 'Previous release recovery was verified.' if coredns__recovered | default(false)
+             else 'No previous release was restored; inspect the collected diagnostics.' }}
+  always:
+    - name: Clean temporary candidate resources
+      ansible.builtin.include_tasks: cleanup.yml

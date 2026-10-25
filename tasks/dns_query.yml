@@ -1,0 +1,35 @@
+---
+# Copyright (C) 2026 Robert Wimmer
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Query DNS through the selected pod
+  kubernetes.core.k8s_exec:
+    namespace: "{{ coredns__probe_namespace | default(coredns_probe_namespace) }}"
+    pod: "{{ coredns__probe | default(coredns_probe_pod) }}"
+    container: "{{ coredns__probe_container | default(coredns_probe_container) | default(omit, true) }}"
+    command: >-
+      dig @{{ coredns__dns_address }} {{ coredns__query[0].name }}
+      {{ coredns__query[0].type | default('A') }} +time=3 +tries=1
+      {{ '+tcp' if coredns__query[1] == 'tcp' else '+notcp +ignore' }}
+      +noall +comments +answer
+  register: coredns__answer
+  changed_when: false
+  until: >-
+    'stdout' in coredns__answer
+    and 'status: NOERROR,' in coredns__answer.stdout
+    and coredns__query[0].expected | difference(
+      (coredns__answer.stdout | regex_findall('(?m)^\S+\s+\d+\s+IN\s+' ~ (coredns__query[0].type | default('A')) ~ '\s+(.+)$') | join(' ')).split()
+    ) | length == 0
+  retries: 6
+  delay: 2
+
+- name: Assert DNS response status and expected answer tokens
+  ansible.builtin.assert:
+    that:
+      - "'status: NOERROR,' in coredns__answer.stdout"
+      - coredns__query[0].expected | length > 0
+      - >-
+        coredns__query[0].expected | difference(
+          (coredns__answer.stdout | regex_findall('(?m)^\S+\s+\d+\s+IN\s+' ~ (coredns__query[0].type | default('A')) ~ '\s+(.+)$') | join(' ')).split()
+        ) | length == 0
+    fail_msg: "DNS validation failed for {{ coredns__query[0].name }} via {{ coredns__dns_address }}: {{ coredns__answer.stdout }}"

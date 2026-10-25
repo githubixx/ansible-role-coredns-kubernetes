@@ -1,0 +1,76 @@
+# Copyright (C) 2026 Robert Wimmer
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# Use this file as coredns_values_template, not as an Ansible playbook.
+# It adds a static hostname and a locally served DNS zone while keeping cluster
+# DNS and forwarding other queries to coredns_upstreams.
+# All names and 192.0.2.x addresses below are examples; replace them for your use.
+#
+# Setting servers replaces the role's entire server list. The first server
+# handles ordinary queries; the second handles the more specific example.test
+# zone. Both accept UDP and TCP on port 53.
+servers:
+  - zones:
+      - zone: .
+        use_tcp: true
+    port: 53
+    plugins:
+      - name: errors
+      - name: health
+        configBlock: lameduck 10s
+      - name: ready
+      # Keep Kubernetes records and reverse lookups for the configured cluster
+      # domain. "pods insecure" creates pod-IP records without checking pods.
+      - name: kubernetes
+        parameters: {{ coredns_cluster_domain }} in-addr.arpa ip6.arpa
+        configBlock: |-
+          pods insecure
+          fallthrough in-addr.arpa ip6.arpa
+      - name: import
+        # Insert the hosts plugin text supplied by zoneFiles below.
+        parameters: /etc/coredns/static-hosts.inc
+      - name: forward
+        parameters: . {{ coredns_upstreams | join(' ') }}
+      - name: prometheus
+        parameters: 0.0.0.0:9153
+      - name: cache
+        parameters: "30"
+      - name: loop
+      - name: reload
+      - name: loadbalance
+  # Answer example.test queries from a local zone file instead of forwarding
+  # them upstream. This is separate from the Kubernetes cluster DNS domain.
+  - zones:
+      - zone: example.test
+        use_tcp: true
+    port: 53
+    plugins:
+      - name: errors
+      - name: file
+        parameters: /etc/coredns/example.test.db example.test
+
+# The Helm chart puts these files in its ConfigMap and mounts them under
+# /etc/coredns. Keep filenames in sync with the import/file paths above.
+# Helm upgrades and rollbacks manage this content along with the Corefile.
+zoneFiles:
+  - filename: static-hosts.inc
+    # Resolve static.internal.test to 192.0.2.7. If a name is not listed here,
+    # fallthrough lets other plugins try to answer it.
+    contents: |
+      hosts {
+        192.0.2.7 static.internal.test
+        fallthrough
+      }
+  - filename: example.test.db
+    # A small authoritative zone: ns.example.test resolves to 192.0.2.53 and
+    # answer.example.test resolves to 192.0.2.42. These are DNS records only;
+    # they do not create a server at either address.
+    # The SOA lists the primary nameserver, contact, serial, and timing values.
+    # Increase the serial (currently 1) when editing the zone. TTLs are seconds.
+    contents: |
+      $ORIGIN example.test.
+      @ 60 IN SOA ns.example.test. hostmaster.example.test. (
+        1 60 60 3600 60 )
+      @ 60 IN NS ns.example.test.
+      ns 60 IN A 192.0.2.53
+      answer 60 IN A 192.0.2.42

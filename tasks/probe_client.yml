@@ -1,0 +1,64 @@
+---
+# Copyright (C) 2026 Robert Wimmer
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Inspect temporary client identity
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: "{{ coredns_namespace }}"
+    name: "{{ coredns_release_name }}-preflight-client"
+  register: coredns__client_collision
+
+- name: Refuse an existing temporary client
+  ansible.builtin.assert:
+    that: coredns__client_collision.resources | length == 0
+    fail_msg: Temporary client name already exists; inspect it before retrying.
+
+- name: Record temporary client ownership
+  ansible.builtin.set_fact:
+    coredns__client_owned: true
+    coredns__probe: "{{ coredns_release_name }}-preflight-client"
+    coredns__probe_namespace: "{{ coredns_namespace }}"
+    coredns__probe_container: dns
+
+- name: Create temporary DNS client
+  kubernetes.core.k8s:
+    state: present
+    wait: true
+    wait_timeout: "{{ coredns_timeout }}"
+    wait_condition:
+      type: Ready
+      status: "True"
+    definition:
+      apiVersion: v1
+      kind: Pod
+      metadata:
+        name: "{{ coredns__probe }}"
+        namespace: "{{ coredns_namespace }}"
+        labels:
+          app.kubernetes.io/managed-by: githubixx.coredns
+      spec:
+        automountServiceAccountToken: false
+        dnsPolicy: Default
+        restartPolicy: Never
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 65532
+          seccompProfile:
+            type: RuntimeDefault
+        containers:
+          - name: dns
+            image: "{{ coredns_probe_image }}"
+            command: [sleep, "3600"]
+            resources:
+              requests:
+                cpu: 10m
+                memory: 16Mi
+              limits:
+                memory: 64Mi
+            securityContext:
+              allowPrivilegeEscalation: false
+              readOnlyRootFilesystem: true
+              capabilities:
+                drop: [ALL]
