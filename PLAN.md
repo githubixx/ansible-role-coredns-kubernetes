@@ -1,3 +1,8 @@
+<!--
+Copyright (C) 2026 Robert Wimmer
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # CoreDNS role progress
 
 ## Approved scope
