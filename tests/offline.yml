@@ -1,0 +1,180 @@
+---
+# Copyright (C) 2026 Robert Wimmer
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Exercise native tag routing against the real chart
+  hosts: localhost
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+    coredns__test_playbook: "{{ playbook_dir }}/render.yml"
+  tasks:
+    - name: Allocate isolated render artifacts
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: coredns-offline-
+      register: coredns__test_directory
+
+    - name: Run offline acceptance cases
+      environment:
+        ANSIBLE_ROLES_PATH: "{{ lookup('ansible.builtin.config', 'DEFAULT_ROLES_PATH') | join(':') }}"
+        ANSIBLE_COLLECTIONS_PATH: "{{ lookup('ansible.builtin.config', 'COLLECTIONS_PATHS') | join(':') }}"
+        COREDNS_TEST_OUTPUT: "{{ coredns__test_directory.path }}"
+        KUBECONFIG: "{{ coredns__test_directory.path }}/nonexistent-kubeconfig"
+        K8S_AUTH_KUBECONFIG: "{{ coredns__test_directory.path }}/nonexistent-kubeconfig"
+      block:
+        - name: Render pinned chart using explicit native tag
+          ansible.builtin.command:
+            argv: [ansible-playbook, -i, "localhost,", "{{ coredns__test_playbook }}", --tags, coredns_template]
+          changed_when: false
+          register: coredns__render_test
+
+        - name: Read actual rendered chart
+          ansible.builtin.slurp:
+            src: "{{ coredns__test_directory.path }}/template.yml"
+          register: coredns__rendered_file
+
+        - name: Assert real rendered output
+          ansible.builtin.assert:
+            that:
+              - "'clusterIP: 10.32.0.254' in coredns__rendered_file.content | b64decode"
+              - "'replicas: 2' in coredns__rendered_file.content | b64decode"
+              - "'maxUnavailable: 0' in coredns__rendered_file.content | b64decode"
+              - "'checksum/config:' in coredns__rendered_file.content | b64decode"
+              - "'forward . 1.1.1.1 9.9.9.9' in coredns__rendered_file.content | b64decode"
+              - "'kubernetes cluster.local in-addr.arpa ip6.arpa' in coredns__rendered_file.content | b64decode"
+              - "'coredns-1.49.0' in coredns__rendered_file.content | b64decode"
+
+        - name: Render documented templates and precedence cases
+          ansible.builtin.include_tasks: render_case.yml
+          loop:
+            - extra:
+                coredns_values_template: "{{ playbook_dir | dirname }}/examples/quad9-dot.yml.j2"
+                coredns_cluster_domain: molecule.local
+              expected: tls_servername dns.quad9.net
+              forbidden: forward . 1.1.1.1
+            - extra:
+                coredns_values_template: "{{ playbook_dir | dirname }}/examples/custom-zones.yml.j2"
+              expected: /etc/coredns/static-hosts.inc
+            - extra:
+                coredns_values_template: "{{ playbook_dir | dirname }}/examples/quad9-dot.yml.j2"
+                coredns_values:
+                  resources:
+                    limits:
+                      memory: 256Mi
+              expected: 256Mi
+            - extra:
+                coredns_values: {replicaCount: 1}
+                coredns_allow_reduced_availability: "true"
+              expected: "replicas: 1"
+            - extra:
+                coredns_values:
+                  podDisruptionBudget: {minAvailable: null, maxUnavailable: "50%"}
+              expected: "50%"
+            - extra:
+                coredns_values: {podDisruptionBudget: null}
+                coredns_allow_reduced_availability: true
+              expected: "kind: Deployment"
+              forbidden: "kind: PodDisruptionBudget"
+          loop_control:
+            loop_var: coredns__example
+            label: "{{ coredns__example.expected }}"
+
+        - name: Test dynamic role inclusion with explicit tag propagation
+          ansible.builtin.command:
+            argv: [ansible-playbook, -i, "localhost,", "{{ playbook_dir }}/include.yml", --tags, coredns_template]
+          changed_when: false
+
+        - name: Exercise template check mode with a nonexistent output parent
+          ansible.builtin.command:
+            argv:
+              - ansible-playbook
+              - -i
+              - "localhost,"
+              - "{{ coredns__test_playbook }}"
+              - --tags
+              - coredns_template
+              - --check
+              - -e
+              - coredns_allow_reduced_availability=false
+              - -e
+              - coredns_preflight=false
+              - --extra-vars
+              - "{{ {'coredns_template_path': coredns__test_directory.path ~ '/dry-run/template.yml'} | to_json }}"
+          changed_when: false
+
+        - name: Inspect dry-run output
+          ansible.builtin.stat:
+            path: "{{ coredns__test_directory.path }}/dry-run"
+          register: coredns__check_output
+
+        - name: Require no filesystem mutation from template check mode
+          ansible.builtin.assert:
+            that: not coredns__check_output.stat.exists
+
+        - name: Run invalid selections before cluster access
+          ansible.builtin.command:
+            argv: "{{ ['ansible-playbook', '-i', 'localhost,', coredns__test_playbook] + item.args }}"
+          changed_when: false
+          failed_when: false
+          loop:
+            - args: [--tags, all]
+              error: Fetch release metadata
+            - args: [--tags, inherited]
+              error: Fetch release metadata
+            - args: [--tags, "coredns_present,coredns_absent"]
+              error: Select at most one
+            - args: [--tags, never]
+              error: Select at most one
+            - args: [--tags, coredns_typo]
+              error: Select at most one
+            - args: [--tags, coredns_template, --skip-tags, always]
+              error: Supply an explicit
+            - args: [--tags, coredns_template, -e, coredns_service_ip=not-an-ip]
+              error: Supply an explicit
+            - args: [--tags, coredns_template, -e, '{"coredns_values":{"replicaCount":1}}']
+              error: Effective values violate
+            - args: [--tags, coredns_template, -e, '{"coredns_values":{"replicaCount":1}}', -e, coredns_allow_reduced_availability=false]
+              error: Effective values violate
+            - args: [--tags, coredns_template, -e, '{"coredns_values":{"customAnnotations":{"helm.sh/resource-policy":"keep"}}}']
+              error: Resource retention or Helm hooks are unsupported
+            - args: [--tags, coredns_template, -e, '{"coredns_values":{"customAnnotations":{"helm.sh/hook":"pre-install"}}}']
+              error: Resource retention or Helm hooks are unsupported
+            - args: [--tags, coredns_template, -e, '{"coredns_values":{"podDisruptionBudget":null}}']
+              error: A protective PodDisruptionBudget is required
+            - args: [--tags, coredns_template, -e, '{"coredns_values":{"podDisruptionBudget":{"minAvailable":0}}}']
+              error: The PDB must select DNS pods
+            - args: [--tags, coredns_template, -e, '{"coredns_values":{"podDisruptionBudget":{"minAvailable":null,"maxUnavailable":"51%"}}}']
+              error: The PDB must select DNS pods
+            - args: [--tags, coredns_template, -e, '{"coredns_values":{"podDisruptionBudget":{"selector":{"matchLabels":{"name":"foreign"}}}}}']
+              error: The PDB must select DNS pods
+            - args: [--tags, coredns_absent]
+              error: Removing cluster DNS requires
+          register: coredns__negative_tests
+          no_log: true
+
+        - name: Assert every negative case failed for the intended reason
+          ansible.builtin.assert:
+            that:
+              - item.rc != 0
+              - item.item.error in (item.stdout ~ item.stderr)
+            fail_msg: "{{ (item.stdout ~ '\n' ~ item.stderr)[-6000:] }}"
+          loop: "{{ coredns__negative_tests.results }}"
+          loop_control:
+            label: "{{ item.item.args }}"
+
+        - name: Show native tag surface
+          ansible.builtin.command:
+            argv: [ansible-playbook, -i, "localhost,", "{{ coredns__test_playbook }}", --list-tags]
+          changed_when: false
+          register: coredns__listed_tags
+
+        - name: Assert lifecycle tags are discoverable
+          ansible.builtin.assert:
+            that: item in coredns__listed_tags.stdout
+          loop: [coredns_present, coredns_template, coredns_rollback, coredns_absent]
+      always:
+        - name: Remove this run's isolated artifacts
+          ansible.builtin.file:
+            path: "{{ coredns__test_directory.path }}"
+            state: absent

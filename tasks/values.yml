@@ -1,0 +1,98 @@
+---
+# Copyright (C) 2026 Robert Wimmer
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Validate deployment inputs
+  ansible.builtin.assert:
+    that:
+      - ansible_skip_tags | difference(coredns__operation_tags + ['molecule-notest', 'notest', 'molecule-idempotence-notest']) | length == 0
+      - coredns_chart_version is match('^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][a-zA-Z0-9.-]+)?$')
+      - coredns_service_ip | length > 0
+      - coredns_service_ip is ansible.utils.ip_address
+      - coredns_cluster_domain is match('^[a-z0-9][a-z0-9.-]*[a-z0-9]$')
+      - coredns_upstreams | length > 0
+      - coredns_values is mapping
+    fail_msg: Supply an explicit chart version, DNS Service IP, domain, and values mapping.
+  run_once: true
+
+- name: Load selected values template
+  ansible.builtin.set_fact:
+    coredns__template_values: "{{ (lookup('ansible.builtin.template', coredns_values_template) | from_yaml) if coredns_values_template | length else {} }}"
+  no_log: true
+  run_once: true
+
+- name: Validate template shape
+  ansible.builtin.assert:
+    that: coredns__template_values is mapping
+    fail_msg: The selected values template must produce a YAML mapping.
+  run_once: true
+
+- name: Validate opt-in forwarding probes
+  ansible.builtin.assert:
+    that:
+      - item.name is match('^[a-zA-Z0-9_.-]+$')
+      - item.type | default('A') in ['A', 'AAAA', 'CNAME', 'MX', 'PTR', 'SRV', 'TXT']
+      - item.expected | length > 0
+    fail_msg: Forwarding probes require a DNS name, supported record type, and nonempty expected answer tokens.
+  loop: "{{ coredns_forwarding_probes }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Merge chart values
+  ansible.builtin.set_fact:
+    coredns__values: "{{ coredns__baseline | combine(coredns__template_values, coredns_values, recursive=true, list_merge='replace') }}"
+  no_log: true
+  run_once: true
+
+- name: Validate effective deployment contract
+  ansible.builtin.assert:
+    that:
+      - coredns__values.service.clusterIP == coredns_service_ip
+      - coredns__values.githubixxRole.forwardingProbes == coredns_forwarding_probes
+      - coredns__values.isClusterService | bool
+      - coredns__values.rbac.create | bool
+      - coredns__values.serviceAccount.create | bool
+      - coredns__values.get('serviceType', 'ClusterIP') == 'ClusterIP'
+      - coredns__values.get('deployment', {}).get('enabled', true) | bool
+      - not coredns__values.get('deployment', {}).get('skipConfig', false) | bool
+      - not coredns__values.get('autoscaler', {}).get('enabled', false) | bool
+      - not coredns__values.get('hpa', {}).get('enabled', false) | bool
+      - coredns__values.replicaCount | int >= 1
+      - coredns__values.rollingUpdate.maxSurge | string is match('^[1-9][0-9]*%?$')
+      - coredns_allow_reduced_availability | bool or coredns__values.replicaCount | int >= 2
+      - coredns_allow_reduced_availability | bool or coredns__values.rollingUpdate.maxUnavailable | string in ['0', '0%']
+      - coredns__values.get('readinessProbe', {}).get('enabled', true) | bool
+      - coredns__values.get('livenessProbe', {}).get('enabled', true) | bool
+      - coredns_forwarding_probes | length == 0 or coredns_preflight | bool or coredns_probe_pod | length > 0
+    fail_msg: >-
+      Effective values violate the supported cluster-DNS contract. Keep chart-owned
+      deployment/configuration and dedicated RBAC, matching DNS IP, enabled probes,
+      and fixed replicas. Reduced availability requires explicit acknowledgement.
+      Forwarding checks require preflight or an existing DNS probe pod.
+  run_once: true
+
+- name: Render official chart
+  kubernetes.core.helm_template:
+    binary_path: "{{ coredns_helm_binary }}"
+    chart_ref: coredns
+    chart_repo_url: "{{ coredns_chart_repository }}"
+    chart_version: "{{ coredns_chart_version }}"
+    release_name: "{{ coredns_release_name }}"
+    release_namespace: "{{ coredns_namespace }}"
+    release_values: "{{ coredns__values }}"
+  delegate_to: "{{ coredns_delegate_to }}"
+  become: false
+  run_once: true
+  register: coredns__render
+  changed_when: false
+  no_log: true
+  check_mode: false
+
+- name: Parse chart resources
+  ansible.builtin.set_fact:
+    coredns__manifest: "{{ coredns__render.stdout | from_yaml_all | select('mapping') | list }}"
+  no_log: true
+  run_once: true
+
+- name: Validate rendered chart
+  ansible.builtin.import_tasks: manifest.yml

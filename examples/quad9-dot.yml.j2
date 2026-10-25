@@ -1,0 +1,44 @@
+# Copyright (C) 2026 Robert Wimmer
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# Use this file as coredns_values_template, not as an Ansible playbook.
+# It sends queries not answered locally to Quad9 using authenticated
+# DNS-over-TLS. Pods still query CoreDNS using ordinary UDP/TCP DNS.
+# Allow outbound TCP/853 from CoreDNS and use an image with trusted CA roots.
+#
+# Setting servers replaces the role's entire server list, so this example also
+# includes the cluster DNS, health, readiness, metrics, and caching plugins.
+servers:
+  - zones:
+      - zone: .
+        use_tcp: true
+    port: 53
+    plugins:
+      - name: errors
+      - name: health
+        configBlock: lameduck 10s
+      - name: ready
+      # Answer Kubernetes service/pod and reverse-lookup queries locally.
+      # The domain comes from coredns_cluster_domain; match your kubelets.
+      # "pods insecure" creates pod-IP records without checking pod objects.
+      - name: kubernetes
+        parameters: {{ coredns_cluster_domain }} in-addr.arpa ip6.arpa
+        configBlock: |-
+          pods insecure
+          fallthrough in-addr.arpa ip6.arpa
+          ttl 30
+      - name: prometheus
+        parameters: 0.0.0.0:9153
+      - name: forward
+        parameters: . tls://9.9.9.9
+        # Verify the upstream certificate against dns.quad9.net, even though the
+        # connection uses an IP address. Do not remove certificate verification.
+        # This forwarder uses Quad9 directly, not coredns_upstreams.
+        configBlock: |-
+          tls_servername dns.quad9.net
+          health_check 10s
+      - name: cache
+        parameters: "30"
+      - name: loop
+      - name: reload
+      - name: loadbalance

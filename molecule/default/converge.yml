@@ -1,0 +1,36 @@
+---
+# Copyright (C) 2026 Robert Wimmer
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Deploy role-managed CoreDNS
+  hosts: k8s_assets
+  gather_facts: false
+  become: false
+  pre_tasks:
+    - name: Discover deterministic upstream
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ coredns_kubeconfig }}"
+        api_version: v1
+        kind: Service
+        name: upstream
+        namespace: coredns-tests
+      register: coredns_test_upstream
+
+    - name: Select local upstream
+      ansible.builtin.set_fact:
+        coredns_upstreams: ["{{ coredns_test_upstream.resources[0].spec.clusterIP }}"]
+  roles:
+    - githubixx.coredns
+  post_tasks:
+    - name: Read converged Helm revision
+      kubernetes.core.helm_info:
+        kubeconfig: "{{ coredns_kubeconfig }}"
+        release_name: coredns
+        release_namespace: kube-system
+      register: coredns_test_converged
+
+    - name: Save baseline revision without rewriting during idempotence
+      ansible.builtin.copy:
+        dest: "{{ coredns_test_sdk_directory | dirname }}/baseline-revision"
+        content: "{{ coredns_test_converged.status.revision }}"
+        mode: "0600"

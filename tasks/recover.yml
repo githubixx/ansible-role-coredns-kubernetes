@@ -1,0 +1,41 @@
+---
+# Copyright (C) 2026 Robert Wimmer
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Recover the captured healthy configuration
+  block:
+    - name: Inspect release after failed rollout
+      kubernetes.core.helm_info:
+        release_name: "{{ coredns_release_name }}"
+        release_namespace: "{{ coredns_namespace }}"
+      register: coredns__after_failure
+
+    - name: Check whether Helm already recovered the previous configuration
+      ansible.builtin.set_fact:
+        coredns__atomic_restored: >-
+          {{ coredns__after_failure.status is defined
+             and coredns__after_failure.status.status | lower == 'deployed'
+             and coredns__after_failure.status.chart == coredns__previous.chart
+             and coredns__after_failure.status.manifest == coredns__previous.manifest }}
+        coredns__target_revision: "{{ coredns__previous.revision | int }}"
+
+    - name: Restore the captured revision if Helm did not
+      when: not coredns__atomic_restored
+      ansible.builtin.include_tasks: restore.yml
+
+    - name: Verify atomic restoration
+      when: coredns__atomic_restored
+      ansible.builtin.include_tasks: health.yml
+      vars:
+        coredns__health_manifest: "{{ coredns__previous.manifest }}"
+
+    - name: Record verified recovery
+      ansible.builtin.set_fact:
+        coredns__recovered: true
+  rescue:
+    - name: Report original and recovery failures
+      ansible.builtin.fail:
+        msg: >-
+          Original CoreDNS failure: {{ coredns__original_failure }}.
+          Recovery also failed: {{ ansible_failed_result.msg | default(ansible_failed_result | string) }}.
+          Inspect the release before taking further action.

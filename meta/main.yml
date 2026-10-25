@@ -1,0 +1,21 @@
+---
+# Copyright (C) 2026 Robert Wimmer
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+galaxy_info:
+  author: Robert Wimmer
+  description: Deploy CoreDNS cluster DNS with the official Helm chart.
+  license: GPL-3.0-or-later
+  min_ansible_version: "2.19"
+  role_name: coredns
+  namespace: githubixx
+  platforms:
+    - name: Ubuntu
+      versions:
+        - noble
+  galaxy_tags:
+    - kubernetes
+    - dns
+    - coredns
+    - helm
+dependencies: []

@@ -1,0 +1,41 @@
+---
+# Copyright (C) 2026 Robert Wimmer
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Validate rollback tooling and ownership
+  ansible.builtin.import_tasks: prerequisites.yml
+
+- name: Require an existing release and explicit revision
+  ansible.builtin.assert:
+    that:
+      - coredns__release.status is defined
+      - coredns_rollback_revision | int > 0
+    fail_msg: Explicit rollback requires an existing role-managed release and coredns_rollback_revision.
+
+- name: Check live ownership before rollback
+  ansible.builtin.import_tasks: owned_resources.yml
+  vars:
+    coredns__ownership_manifest: "{{ coredns__release.status.manifest }}"
+
+- name: Select explicit target
+  ansible.builtin.set_fact:
+    coredns__target_revision: "{{ coredns_rollback_revision | int }}"
+    coredns__probe: "{{ coredns_probe_pod }}"
+    coredns__probe_namespace: "{{ coredns_probe_namespace }}"
+    coredns__probe_container: "{{ coredns_probe_container }}"
+
+- name: Roll back requested revision
+  block:
+    - name: Execute guarded restoration
+      ansible.builtin.import_tasks: restore.yml
+  rescue:
+    - name: Preserve rollback failure
+      ansible.builtin.set_fact:
+        coredns__original_failure: "{{ ansible_failed_result.msg | default(ansible_failed_result | string) }}"
+
+    - name: Capture rollback evidence
+      ansible.builtin.include_tasks: diagnostics.yml
+
+    - name: Report rollback failure
+      ansible.builtin.fail:
+        msg: "CoreDNS rollback failed: {{ coredns__original_failure }}. No recursive recovery was attempted."

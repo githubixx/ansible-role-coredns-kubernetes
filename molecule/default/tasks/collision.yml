@@ -1,0 +1,72 @@
+---
+# Copyright (C) 2026 Robert Wimmer
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Inspect foreign fixture identity before using it
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: ConfigMap
+    name: coredns-preflight
+    namespace: kube-system
+  register: coredns_test_collision
+
+- name: Require an unused foreign fixture identity
+  ansible.builtin.assert:
+    that: coredns_test_collision.resources | length == 0
+
+- name: Exercise collision without adopting the fixture
+  block:
+    - name: Create a foreign candidate ConfigMap
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: coredns-preflight
+            namespace: kube-system
+            labels: {app: coredns-collision-fixture}
+          data: {sentinel: do-not-adopt}
+      register: coredns_test_created_collision
+
+    - name: Require failure before live mutation
+      ansible.builtin.include_tasks: exercise.yml
+      vars:
+        coredns_test_case:
+          name: foreign-candidate
+          tags: coredns_present
+          success: false
+          unchanged: true
+          same_revision: true
+          expected_message: already exists
+          extra:
+            coredns_preflight: true
+            coredns_values_template: "{{ playbook_dir }}/templates/exercise-values.yml.j2"
+            coredns_test_variant: upgrade
+
+    - name: Read the foreign fixture again
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: ConfigMap
+        name: coredns-preflight
+        namespace: kube-system
+      register: coredns_test_preserved_collision
+
+    - name: Require unchanged foreign ownership and data
+      ansible.builtin.assert:
+        that:
+          - coredns_test_preserved_collision.resources[0].metadata.uid == coredns_test_created_collision.result.metadata.uid
+          - coredns_test_preserved_collision.resources[0].data.sentinel == 'do-not-adopt'
+          - "'meta.helm.sh/release-name' not in coredns_test_preserved_collision.resources[0].metadata.get('annotations', {})"
+  always:
+    - name: Remove only the fixture UID created by this test
+      when: coredns_test_created_collision.result is defined
+      kubernetes.core.k8s:
+        api_version: v1
+        kind: ConfigMap
+        name: coredns-preflight
+        namespace: kube-system
+        state: absent
+        delete_options:
+          preconditions:
+            uid: "{{ coredns_test_created_collision.result.metadata.uid }}"

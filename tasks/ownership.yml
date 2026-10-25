@@ -1,0 +1,44 @@
+---
+# Copyright (C) 2026 Robert Wimmer
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Validate current resource ownership
+  ansible.builtin.import_tasks: owned_resources.yml
+  vars:
+    coredns__ownership_manifest: "{{ coredns__manifest }}"
+
+- name: Inspect all cluster DNS workloads
+  kubernetes.core.k8s_info:
+    api_version: apps/v1
+    kind: Deployment
+    namespace: kube-system
+  register: coredns__system_deployments
+
+- name: Refuse a second cluster DNS deployment
+  when: >-
+    item.metadata.get('labels', {}).get('k8s-app', '') in ['kube-dns', 'coredns']
+    or item.metadata.name in ['coredns', 'kube-dns']
+  ansible.builtin.assert:
+    that:
+      - item.metadata.get('annotations', {}).get('meta.helm.sh/release-name', '') == coredns_release_name
+      - item.metadata.get('annotations', {}).get('meta.helm.sh/release-namespace', '') == coredns_namespace
+    fail_msg: "Existing cluster DNS deployment {{ item.metadata.name }} must be managed separately; takeover is unsupported."
+  loop: "{{ coredns__system_deployments.resources }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+
+- name: Prevent identity changes on an existing release
+  when: coredns__release.status is defined
+  ansible.builtin.assert:
+    that:
+      - >-
+        (coredns__release.status.manifest | selectattr('kind', 'equalto', 'Deployment')
+         | map(attribute='metadata.name') | list) == [coredns__deployment.metadata.name]
+      - >-
+        (coredns__release.status.manifest | selectattr('kind', 'equalto', 'Service')
+         | selectattr('spec.clusterIP', 'defined') | selectattr('spec.clusterIP', 'equalto', coredns_service_ip)
+         | map(attribute='metadata.name') | list) == [coredns__service.metadata.name]
+      - >-
+        (coredns__release.status.manifest | selectattr('kind', 'equalto', 'Deployment')
+         | first).spec.selector == coredns__deployment.spec.selector
+    fail_msg: Changing the DNS Service IP/name or Deployment name/selector requires a separate migration.

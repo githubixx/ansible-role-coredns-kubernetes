@@ -1,0 +1,24 @@
+---
+# Copyright (C) 2026 Robert Wimmer
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Resolve chart configuration
+  ansible.builtin.import_tasks: values.yml
+
+- name: Export rendered manifests
+  delegate_to: "{{ coredns_delegate_to }}"
+  become: false
+  run_once: true
+  block:
+    - name: Create template output directory
+      ansible.builtin.file:
+        path: "{{ coredns_template_path | dirname }}"
+        state: directory
+        mode: "0700"
+
+    - name: Save rendered manifests
+      ansible.builtin.copy:
+        content: "{{ coredns__render.stdout }}"
+        dest: "{{ coredns_template_path }}"
+        mode: "0600"
+      no_log: true

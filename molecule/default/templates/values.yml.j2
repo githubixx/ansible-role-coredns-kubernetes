@@ -1,0 +1,14 @@
+# Copyright (C) 2026 Robert Wimmer
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Cilium is a test dependency, not the subject of this scenario.
+kubeProxyReplacement: "false"
+etcd:
+  enabled: false
+ipam:
+  mode: cluster-pool
+  operator:
+    clusterPoolIPv4PodCIDRList: ["10.200.0.0/16"]
+    clusterPoolIPv4MaskSize: 24
+cni:
+  chainingMode: portmap

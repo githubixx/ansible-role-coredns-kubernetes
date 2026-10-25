@@ -1,0 +1,40 @@
+---
+# Copyright (C) 2026 Robert Wimmer
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Manage CoreDNS once on the execution host
+  delegate_to: "{{ coredns_delegate_to }}"
+  become: false
+  run_once: true
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: "{{ coredns_kubeconfig | default(omit, true) }}"
+      context: "{{ coredns_context | default(omit, true) }}"
+    group/kubernetes.core.helm:
+      kubeconfig: "{{ coredns_kubeconfig | default(omit, true) }}"
+      context: "{{ coredns_context | default(omit, true) }}"
+      binary_path: "{{ coredns_helm_binary }}"
+  block:
+    - name: Validate lifecycle selection
+      ansible.builtin.import_tasks: selection.yml
+      tags: always
+
+    - name: Reconcile CoreDNS
+      when: ansible_run_tags | intersect(coredns__operation_tags | difference(['coredns_present'])) | length == 0
+      ansible.builtin.import_tasks: present.yml
+      tags: coredns_present
+
+    - name: Render CoreDNS
+      when: "'coredns_template' in ansible_run_tags"
+      ansible.builtin.import_tasks: template.yml
+      tags: [never, coredns_template]
+
+    - name: Roll back CoreDNS
+      when: "'coredns_rollback' in ansible_run_tags"
+      ansible.builtin.import_tasks: rollback.yml
+      tags: [never, coredns_rollback]
+
+    - name: Remove CoreDNS
+      when: "'coredns_absent' in ansible_run_tags"
+      ansible.builtin.import_tasks: absent.yml
+      tags: [never, coredns_absent]

@@ -1,0 +1,112 @@
+---
+# Copyright (C) 2026 Robert Wimmer
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Resolve isolated candidate values
+  ansible.builtin.set_fact:
+    coredns__candidate_name: "{{ coredns_release_name }}-preflight"
+    coredns__candidate_values: >-
+      {{ coredns__values | combine({
+        'fullnameOverride': coredns_release_name ~ '-preflight',
+        'k8sAppLabelOverride': coredns_release_name ~ '-preflight',
+        'replicaCount': 1,
+        'deployment': {'name': coredns_release_name ~ '-preflight', 'selector': {}},
+        'service': {'name': coredns_release_name ~ '-preflight', 'clusterIP': '', 'clusterIPs': [], 'selector': {}},
+        'serviceAccount': {'name': coredns_release_name ~ '-preflight', 'create': true},
+        'clusterRole': {'nameOverride': coredns_release_name ~ '-preflight'},
+        'podDisruptionBudget': {},
+        'affinity': {}
+      }, recursive=true) | combine({'affinity': {}, 'podDisruptionBudget': {}}) }}
+
+- name: Render isolated candidate
+  kubernetes.core.helm_template:
+    binary_path: "{{ coredns_helm_binary }}"
+    chart_ref: coredns
+    chart_repo_url: "{{ coredns_chart_repository }}"
+    chart_version: "{{ coredns_chart_version }}"
+    release_name: "{{ coredns__candidate_name }}"
+    release_namespace: "{{ coredns_namespace }}"
+    release_values: "{{ coredns__candidate_values }}"
+  register: coredns__candidate_render
+  changed_when: false
+  no_log: true
+
+- name: Parse candidate resources
+  ansible.builtin.set_fact:
+    coredns__candidate_manifest: "{{ coredns__candidate_render.stdout | from_yaml_all | select('mapping') | list }}"
+  no_log: true
+
+- name: Require isolated resource names and selectors
+  ansible.builtin.assert:
+    that:
+      - item.metadata.name not in (coredns__manifest | map(attribute='metadata.name') | list)
+      - item.metadata.labels['app.kubernetes.io/instance'] == coredns__candidate_name
+      - item.kind != 'Service' or item.spec.selector['app.kubernetes.io/instance'] == coredns__candidate_name
+      - item.kind != 'Deployment' or item.spec.selector.matchLabels['app.kubernetes.io/instance'] == coredns__candidate_name
+      - item.kind != 'Deployment' or item.spec.template.metadata.labels['app.kubernetes.io/instance'] == coredns__candidate_name
+    fail_msg: "Candidate isolation failed for {{ item.kind }}/{{ item.metadata.name }}."
+  loop: "{{ coredns__candidate_manifest }}"
+  loop_control:
+    label: "{{ item.kind }}/{{ item.metadata.name }}"
+
+- name: Inspect candidate release collision
+  kubernetes.core.helm_info:
+    release_name: "{{ coredns__candidate_name }}"
+    release_namespace: "{{ coredns_namespace }}"
+    release_state: all
+  register: coredns__candidate_existing
+
+- name: Reject leftover candidate release
+  ansible.builtin.assert:
+    that: coredns__candidate_existing.status is not defined
+    fail_msg: A preflight release already exists. Inspect and remove it explicitly before retrying.
+
+- name: Inspect candidate resource collisions
+  kubernetes.core.k8s_info:
+    api_version: "{{ item.apiVersion }}"
+    kind: "{{ item.kind }}"
+    name: "{{ item.metadata.name }}"
+    namespace: "{{ item.metadata.namespace | default(omit) }}"
+  loop: "{{ coredns__candidate_manifest }}"
+  loop_control:
+    label: "{{ item.kind }}/{{ item.metadata.name }}"
+  register: coredns__candidate_collisions
+
+- name: Reject existing candidate resource identities
+  ansible.builtin.assert:
+    that: item.resources | length == 0
+    fail_msg: "Candidate resource {{ item.item.kind }}/{{ item.item.metadata.name }} already exists."
+  loop: "{{ coredns__candidate_collisions.results }}"
+  loop_control:
+    label: "{{ item.item.kind }}/{{ item.item.metadata.name }}"
+
+- name: Mark candidate as owned by this execution
+  ansible.builtin.set_fact:
+    coredns__candidate_owned: true
+
+- name: Deploy isolated candidate atomically
+  kubernetes.core.helm:
+    release_name: "{{ coredns__candidate_name }}"
+    release_namespace: "{{ coredns_namespace }}"
+    chart_ref: coredns
+    chart_repo_url: "{{ coredns_chart_repository }}"
+    chart_version: "{{ coredns_chart_version }}"
+    release_values: "{{ coredns__candidate_values }}"
+    force: false
+    replace: false
+    take_ownership: false
+    wait: true
+    atomic: true
+    timeout: "{{ coredns_timeout }}s"
+  no_log: true
+
+- name: Fetch candidate release contract
+  kubernetes.core.helm_info:
+    release_name: "{{ coredns__candidate_name }}"
+    release_namespace: "{{ coredns_namespace }}"
+  register: coredns__candidate_release
+
+- name: Validate candidate health and DNS before production mutation
+  ansible.builtin.include_tasks: health.yml
+  vars:
+    coredns__health_manifest: "{{ coredns__candidate_release.status.manifest }}"

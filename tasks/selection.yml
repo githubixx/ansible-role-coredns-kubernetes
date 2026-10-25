@@ -1,0 +1,30 @@
+---
+# Copyright (C) 2026 Robert Wimmer
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Validate native tag contract
+  ansible.builtin.assert:
+    that:
+      - ansible_version.full is version('2.19', '>=')
+      - ansible_run_tags | intersect(coredns__operation_tags) | length <= 1
+      - ansible_run_tags | select('match', '^coredns_') | difference(coredns__operation_tags) | length == 0
+      - "'never' not in ansible_run_tags"
+      - ansible_skip_tags | difference(coredns__operation_tags + ['molecule-notest', 'notest', 'molecule-idempotence-notest']) | length == 0
+      - coredns_action is not defined
+      - coredns_state is not defined
+    fail_msg: >-
+      Select at most one of {{ coredns__operation_tags }}. Do not select never,
+      skip mandatory/inherited tags, or use coredns_action/coredns_state.
+      Only complete lifecycle entry points may be skipped.
+  run_once: true
+
+- name: Validate shared configuration
+  ansible.builtin.assert:
+    that:
+      - coredns_release_name is match('^[a-z0-9](?:[a-z0-9-]{0,40}[a-z0-9])?$')
+      - coredns_namespace is match('^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$')
+      - coredns_timeout | int > 0
+      - coredns_history_max | int >= 3
+      - coredns_helm_binary | length > 0
+    fail_msg: Invalid release/namespace, timeout, history limit, or Helm binary.
+  run_once: true

@@ -1,0 +1,24 @@
+---
+# Copyright (C) 2026 Robert Wimmer
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Render an example through the public role interface
+  ansible.builtin.command:
+    argv: >-
+      {{ ['ansible-playbook', '-i', 'localhost,',
+          coredns__test_playbook, '--tags', 'coredns_template', '--extra-vars', coredns__example.extra | to_json] }}
+  changed_when: false
+  register: coredns__example_execution
+
+- name: Read generated example manifests
+  ansible.builtin.slurp:
+    src: "{{ coredns__test_directory.path }}/template.yml"
+  register: coredns__example_content
+
+- name: Assert the intended configuration and replacement behavior
+  ansible.builtin.assert:
+    that:
+      - coredns__example.expected in coredns__example_content.content | b64decode
+      - coredns__example.forbidden is not defined or coredns__example.forbidden not in coredns__example_content.content | b64decode
+      - coredns__example.extra.coredns_cluster_domain is not defined or ('kubernetes ' ~ coredns__example.extra.coredns_cluster_domain) in coredns__example_content.content | b64decode
+    fail_msg: "Rendered example did not implement {{ coredns__example }}."

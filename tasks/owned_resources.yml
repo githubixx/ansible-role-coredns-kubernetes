@@ -1,0 +1,27 @@
+---
+# Copyright (C) 2026 Robert Wimmer
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Inspect managed resource identities
+  kubernetes.core.k8s_info:
+    api_version: "{{ item.apiVersion }}"
+    kind: "{{ item.kind }}"
+    name: "{{ item.metadata.name }}"
+    namespace: "{{ item.metadata.namespace | default(omit) }}"
+  loop: "{{ coredns__ownership_manifest }}"
+  loop_control:
+    label: "{{ item.kind }}/{{ item.metadata.name }}"
+  register: coredns__existing
+
+- name: Refuse resources not owned by this release
+  when: item.resources | length > 0
+  ansible.builtin.assert:
+    that:
+      - coredns__release.status is defined
+      - item.resources[0].metadata.get('labels', {}).get('app.kubernetes.io/managed-by', '') == 'Helm'
+      - item.resources[0].metadata.get('annotations', {}).get('meta.helm.sh/release-name', '') == coredns_release_name
+      - item.resources[0].metadata.get('annotations', {}).get('meta.helm.sh/release-namespace', '') == coredns_namespace
+    fail_msg: "Refusing foreign resource {{ item.item.kind }}/{{ item.item.metadata.name }}. Adoption is not supported."
+  loop: "{{ coredns__existing.results }}"
+  loop_control:
+    label: "{{ item.item.kind }}/{{ item.item.metadata.name }}"

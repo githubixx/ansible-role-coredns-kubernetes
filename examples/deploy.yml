@@ -1,0 +1,34 @@
+---
+# Copyright (C) 2026 Robert Wimmer
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# Run this playbook from the role directory:
+#   ansible-playbook examples/deploy.yml
+# It installs or updates the role-managed Helm release.
+# See README.md in this directory for prerequisites and examples.
+- name: Manage cluster DNS
+  hosts: localhost
+  gather_facts: false
+  vars:
+    # Run Kubernetes modules with the same Python that runs this playbook.
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+
+    # Replace this example with the DNS Service IP configured in every kubelet's
+    # clusterDNS setting. The role does not choose an IP or reconfigure kubelets.
+    coredns_service_ip: "10.32.0.254"
+
+    # If your kubelets use a domain other than cluster.local, set it here:
+    # coredns_cluster_domain: my-cluster.internal
+
+    # Optional: choose one of the chart-values templates next to this playbook.
+    # Without a template, the role uses its built-in DNS configuration.
+    # coredns_values_template: "{{ playbook_dir }}/quad9-dot.yml.j2"
+
+    # Optional: change individual chart settings without copying all of them.
+    # This changes only the memory limit; other resource settings are retained.
+    # coredns_values:
+    #   resources:
+    #     limits:
+    #       memory: 256Mi
+  roles:
+    - githubixx.coredns

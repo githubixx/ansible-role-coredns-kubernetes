@@ -1,0 +1,284 @@
+---
+# Copyright (C) 2026 Robert Wimmer
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Capture revision that will be pruned
+  kubernetes.core.helm_info:
+    release_name: coredns
+    release_namespace: kube-system
+  register: coredns_test_pruned
+
+- name: Capture DNS pods before a probe-only change
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: kube-system
+    label_selectors: [k8s-app=kube-dns]
+  register: coredns_test_contract_pods
+
+- name: Discover an additional deterministic probe answer
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Service
+    namespace: default
+    name: kubernetes
+  register: coredns_test_contract_api
+
+- name: Retain a probe-only change as a newer successful revision
+  ansible.builtin.include_tasks: exercise.yml
+  vars:
+    coredns_test_case:
+      name: probe-contract-only
+      success: true
+      extra:
+        coredns_forwarding_probes:
+          - {name: answer.example.test., type: A, expected: ["192.0.2.42"]}
+          - name: kubernetes.default.svc.cluster.local.
+            type: A
+            expected: ["{{ coredns_test_contract_api.resources[0].spec.clusterIP }}"]
+
+- name: Read pods after updating only the probe contract
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: kube-system
+    label_selectors: [k8s-app=kube-dns]
+  register: coredns_test_contract_after
+
+- name: Require Helm to retain new checks without restarting DNS pods
+  ansible.builtin.assert:
+    that:
+      - coredns_test_after.status.revision | int > coredns_test_pruned.status.revision | int
+      - coredns_test_after.status.release_values.githubixxRole.forwardingProbes | length == 2
+      - >-
+        coredns_test_contract_pods.resources | map(attribute='metadata.uid') | sort
+        == coredns_test_contract_after.resources | map(attribute='metadata.uid') | sort
+
+- name: Prune only the superseded fixture revision
+  kubernetes.core.k8s:
+    state: absent
+    api_version: v1
+    kind: Secret
+    name: "sh.helm.release.v1.coredns.v{{ coredns_test_pruned.status.revision }}"
+    namespace: kube-system
+  no_log: true
+
+- name: Reject an actually pruned revision without mutation
+  ansible.builtin.include_tasks: exercise.yml
+  vars:
+    coredns_test_case:
+      name: pruned-revision
+      tags: coredns_rollback
+      success: false
+      unchanged: true
+      same_revision: true
+      expected_message: is not a retained deployed/superseded revision
+      extra:
+        coredns_rollback_revision: "{{ coredns_test_pruned.status.revision | int }}"
+
+- name: Check foreign production ownership across all mutation paths
+  block:
+    - name: Mark the live DNS Service as foreign without disrupting DNS
+      kubernetes.core.k8s:
+        state: patched
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: kube-dns
+            namespace: kube-system
+            annotations:
+              meta.helm.sh/release-name: foreign-fixture
+
+    - name: Reject foreign resources before any lifecycle mutation
+      ansible.builtin.include_tasks: exercise.yml
+      loop: [coredns_present, coredns_rollback, coredns_absent]
+      loop_control:
+        loop_var: coredns_test_foreign_tag
+      vars:
+        coredns_test_case:
+          name: "foreign-{{ coredns_test_foreign_tag }}"
+          tags: "{{ coredns_test_foreign_tag }}"
+          success: false
+          unchanged: true
+          same_revision: true
+          expected_message: Refusing foreign resource Service/kube-dns
+          extra:
+            coredns_allow_removal: true
+            coredns_rollback_revision: "{{ coredns_test_after.status.revision | int }}"
+  always:
+    - name: Restore fixture Service ownership
+      kubernetes.core.k8s:
+        state: patched
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: kube-dns
+            namespace: kube-system
+            annotations:
+              meta.helm.sh/release-name: coredns
+
+- name: Capture a retained revision containing the PDB
+  kubernetes.core.helm_info:
+    release_name: coredns
+    release_namespace: kube-system
+  register: coredns_test_reintroduced_target
+
+- name: Guard ownership of resources present only in the rollback target
+  block:
+    - name: Remove the PDB through an acknowledged chart upgrade
+      ansible.builtin.include_tasks: exercise.yml
+      vars:
+        coredns_test_case:
+          name: prepare-reintroduced-resource
+          success: true
+          extra:
+            coredns_allow_reduced_availability: true
+            coredns_values:
+              podDisruptionBudget: null
+
+    - name: Create a foreign PDB at the retained target's resource identity
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: policy/v1
+          kind: PodDisruptionBudget
+          metadata:
+            name: coredns
+            namespace: kube-system
+            labels:
+              app.kubernetes.io/managed-by: Helm
+            annotations:
+              meta.helm.sh/release-name: foreign-fixture
+              meta.helm.sh/release-namespace: kube-system
+          spec:
+            minAvailable: 1
+            selector:
+              matchLabels:
+                k8s-app: kube-dns
+
+    - name: Reject rollback before it could adopt the foreign target resource
+      ansible.builtin.include_tasks: exercise.yml
+      vars:
+        coredns_test_case:
+          name: foreign-reintroduced-resource
+          tags: coredns_rollback
+          success: false
+          unchanged: true
+          same_revision: true
+          expected_message: Refusing foreign resource PodDisruptionBudget/coredns
+          extra:
+            coredns_rollback_revision: "{{ coredns_test_reintroduced_target.status.revision | int }}"
+  always:
+    - name: Remove the deliberately foreign fixture PDB
+      kubernetes.core.k8s:
+        state: absent
+        api_version: policy/v1
+        kind: PodDisruptionBudget
+        name: coredns
+        namespace: kube-system
+
+    - name: Restore the retained PDB through explicit guarded rollback
+      ansible.builtin.include_tasks: exercise.yml
+      vars:
+        coredns_test_case:
+          name: restore-reintroduced-resource
+          tags: coredns_rollback
+          success: true
+          extra:
+            coredns_rollback_revision: "{{ coredns_test_reintroduced_target.status.revision | int }}"
+
+- name: Capture the healthy recovery target
+  kubernetes.core.helm_info:
+    release_name: coredns
+    release_namespace: kube-system
+  register: coredns_test_recovery_target
+
+- name: Test explicit reporting when recovery itself is rejected
+  block:
+    - name: Deny only a restoration of the captured fixture checksum
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: admissionregistration.k8s.io/v1
+          kind: ValidatingAdmissionPolicy
+          metadata:
+            name: coredns-molecule-block-recovery
+          spec:
+            failurePolicy: Fail
+            matchConstraints:
+              resourceRules:
+                - apiGroups: [apps]
+                  apiVersions: [v1]
+                  operations: [UPDATE]
+                  resources: [deployments]
+            matchConditions:
+              - name: only-fixture
+                expression: request.namespace == 'kube-system' && object.metadata.name == 'coredns'
+            validations:
+              - expression: >-
+                  object.spec.template.metadata.annotations['checksum/config'] != {{ coredns_test_recovery_checksum | to_json }}
+                  || oldObject.spec.template.metadata.annotations['checksum/config'] == {{ coredns_test_recovery_checksum | to_json }}
+                message: Molecule deliberately blocks restoring the captured baseline.
+      vars:
+        coredns_test_recovery_checksum: >-
+          {{ (coredns_test_recovery_target.status.manifest | selectattr('kind', 'equalto', 'Deployment')
+              | first).spec.template.metadata.annotations['checksum/config'] }}
+
+    - name: Bind the temporary recovery-failure policy
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: admissionregistration.k8s.io/v1
+          kind: ValidatingAdmissionPolicyBinding
+          metadata:
+            name: coredns-molecule-block-recovery
+          spec:
+            policyName: coredns-molecule-block-recovery
+            validationActions: [Deny]
+
+    - name: Require both original and recovery failures to be surfaced
+      ansible.builtin.include_tasks: exercise.yml
+      vars:
+        coredns_test_case:
+          name: recovery-failure
+          success: false
+          expected_status: failed
+          expected_message: Recovery also failed
+          extra:
+            coredns_timeout: 90
+            coredns_values_template: "{{ playbook_dir }}/templates/exercise-values.yml.j2"
+            coredns_test_variant: semantic
+  always:
+    - name: Remove only the temporary admission controls
+      kubernetes.core.k8s:
+        state: absent
+        api_version: admissionregistration.k8s.io/v1
+        kind: "{{ item }}"
+        name: coredns-molecule-block-recovery
+      loop: [ValidatingAdmissionPolicyBinding, ValidatingAdmissionPolicy]
+
+    - name: Restore DNS explicitly after the deliberate recovery failure
+      ansible.builtin.include_tasks: exercise.yml
+      vars:
+        coredns_test_case:
+          name: restore-after-recovery-failure
+          tags: coredns_rollback
+          success: true
+          extra:
+            coredns_rollback_revision: "{{ coredns_test_recovery_target.status.revision | int }}"
+
+- name: Validate an older retained target after lowering the desired retention limit
+  ansible.builtin.include_tasks: exercise.yml
+  vars:
+    coredns_test_case:
+      name: lowered-history-limit
+      tags: coredns_rollback
+      check: true
+      success: true
+      unchanged: true
+      same_revision: true
+      extra:
+        coredns_history_max: 3
+        coredns_rollback_revision: "{{ coredns_test_reintroduced_target.status.revision | int }}"

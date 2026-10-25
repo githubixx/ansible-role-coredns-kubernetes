@@ -1,0 +1,16 @@
+---
+# Copyright (C) 2026 Robert Wimmer
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Exercise caller-side dynamic tag propagation
+  hosts: localhost
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+    coredns_service_ip: "10.32.0.254"
+    coredns_template_path: "{{ lookup('ansible.builtin.env', 'COREDNS_TEST_OUTPUT') }}/dynamic.yml"
+  tasks:
+    - name: Include CoreDNS under requested operation tags
+      ansible.builtin.include_role:
+        name: githubixx.coredns
+      tags: always

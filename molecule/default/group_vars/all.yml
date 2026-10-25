@@ -1,0 +1,319 @@
+---
+# Copyright (C) 2026 Robert Wimmer
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# Settings shared by the disposable VMs in this Molecule scenario.
+# These values build a test cluster; they are not production recommendations.
+
+# CoreDNS: address allocation and test tooling
+
+# Last IPv4 octet assigned to each VM. The WireGuard settings below use this
+# table for both the private transport network and the encrypted cluster network.
+# Keep hostnames and transport addresses in sync with molecule.yml.
+coredns_test_addresses:
+  coredns-assets: 5
+  coredns-controller1: 10
+  coredns-controller2: 20
+  coredns-controller3: 30
+  coredns-etcd1: 100
+  coredns-etcd2: 110
+  coredns-etcd3: 120
+  coredns-worker1: 200
+  coredns-worker2: 210
+
+# Python dependency directory relative to the vagrant user's home on the assets
+# VM. Preparation creates it; group_vars/k8s_assets.yml selects its interpreter.
+coredns_test_sdk_directory: .local/share/coredns-molecule/sdk
+
+# CoreDNS: deployment and functional DNS checks
+
+# Run Helm and Kubernetes operations on the assets VM, which has the required
+# tools, Python dependencies, and administrator kubeconfig.
+coredns_delegate_to: coredns-assets
+
+# Cluster DNS Service IP. Must match the kubelets' clusterDNS setting; it is not
+# an arbitrary available Service IP. Changing it requires a separate migration.
+coredns_service_ip: "10.32.0.254"
+
+# Administrator credentials on the assets VM, created by the controller role.
+coredns_kubeconfig: /home/vagrant/.kube/admin.kubeconfig
+
+# Existing pod with dig used by the role to check DNS over UDP and TCP.
+# Preparation creates this client on worker1 before CoreDNS is deployed.
+coredns_probe_pod: client-coredns-worker1
+
+# Namespace containing the probe pod and the other DNS test fixtures.
+coredns_probe_namespace: coredns-tests
+
+# Check forwarding against the local test upstream's fixed answer. Each entry
+# supplies a DNS name, record type, and expected answer tokens. Public-name
+# lookups with changing addresses are checked separately in verify.yml.
+coredns_forwarding_probes:
+  - name: answer.example.test.
+    type: A
+    expected: ["192.0.2.42"]
+
+# Kubernetes: common networking and service accounts
+
+# Interface used for communication between cluster nodes. WireGuard creates wg0
+# during preparation; etcd, API endpoints, and kubelet node addresses use it.
+k8s_interface: wg0
+
+# Cluster name written into the generated kubeconfigs.
+k8s_config_cluster_name: coredns-molecule
+
+# Operating-system account used by Kubernetes services, not a Kubernetes
+# ServiceAccount or the user running Ansible.
+k8s_run_as_user: k8s
+
+# Operating-system group used by those services and their protected files.
+k8s_run_as_group: k8s
+
+# Fixed base64-encoded encryption key for this disposable cluster only.
+# The controller role uses it to generate the API server's configuration for
+# encrypting Secrets in etcd. Never reuse this public test key in production.
+k8s_encryption_config_key: "Y29uZmlndXJhdGlvbjIyCg=="
+
+# Kubernetes: certificate files
+
+# Certificate output directory on the assets VM. Preparation also copies the
+# files to the same path on the machine running Molecule for role file transfers.
+k8s_ca_conf_directory: "{{ k8s_ctl_ca_conf_directory }}"
+
+# Only the directory owner may read, write, or enter the certificate directory.
+k8s_ca_conf_directory_perm: "0700"
+
+# Only the owner may read or write certificate material, including private keys.
+k8s_ca_file_perm: "0600"
+
+# Let the unprivileged assets user read certificates when creating kubeconfigs.
+k8s_ca_certificate_owner: vagrant
+
+# Group assigned to the generated certificate files.
+k8s_ca_certificate_group: vagrant
+
+# Kubernetes: controller tooling and API endpoint
+
+# Host where the controller role generates kubeconfigs and runs delegated tools.
+k8s_ctl_delegate_to: coredns-assets
+
+# Keep certificate artifacts under Molecule's generated scenario directory,
+# rather than using certificates from an existing cluster.
+k8s_ctl_ca_conf_directory: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/ca"
+
+# Network interface through which API servers reach the etcd nodes.
+k8s_ctl_etcd_interface: "{{ k8s_interface }}"
+
+# Shared API entry point used in kubeconfigs: controller1's WireGuard address
+# and the HAProxy frontend port. This test endpoint is not a floating address.
+k8s_ctl_api_endpoint_host: "10.10.31.10"
+
+# Must match haproxy_frontend_port; backend API servers listen on 6443 instead.
+k8s_ctl_api_endpoint_port: "16443"
+
+# Kubernetes: administrator access
+
+# Directory on the assets VM containing admin.kubeconfig.
+k8s_admin_conf_dir: /home/vagrant/.kube
+
+# Restrict access to the directory containing administrator credentials.
+k8s_admin_conf_dir_perm: "0700"
+
+# Assets user that runs kubectl, Helm, and the DNS tests.
+k8s_admin_conf_owner: vagrant
+
+# Group assigned to the administrator kubeconfig directory.
+k8s_admin_conf_group: vagrant
+
+# Use the same API entry point for administrator and component kubeconfigs.
+k8s_admin_api_endpoint_host: "{{ k8s_ctl_api_endpoint_host }}"
+
+# HAProxy frontend port used by administrator clients.
+k8s_admin_api_endpoint_port: "{{ k8s_ctl_api_endpoint_port }}"
+
+# Algorithm for the administrator client certificate's private key.
+k8s_admin_csr_key_algo: ecdsa
+
+# ECDSA key size in bits; use the matching size when changing the algorithm.
+k8s_admin_csr_key_size: "384"
+
+# Kubernetes: API server
+
+# Route aggregated API requests to endpoint IPs rather than the Service IP.
+k8s_apiserver_settings_user:
+  enable-aggregator-routing: "true"
+
+# Common name in the API server's certificate signing request (CSR).
+k8s_apiserver_csr_cn: k8s-apiserver
+
+# Private-key algorithm for the API server's serving certificate.
+k8s_apiserver_csr_key_algo: ecdsa
+
+# ECDSA key size in bits for that certificate.
+k8s_apiserver_csr_key_size: "384"
+
+# Kubernetes: controller-manager identity
+
+# Client certificate identity used by the controller manager to access the API.
+k8s_controller_manager_csr_cn: system:kube-controller-manager
+
+# Private-key algorithm for the controller-manager client certificate.
+k8s_controller_manager_csr_key_algo: ecdsa
+
+# ECDSA key size in bits for that certificate.
+k8s_controller_manager_csr_key_size: "384"
+
+# Kubernetes: scheduler identity
+
+# Client certificate identity used by the scheduler to access the API.
+k8s_scheduler_csr_cn: system:kube-scheduler
+
+# Private-key algorithm for the scheduler client certificate.
+k8s_scheduler_csr_key_algo: ecdsa
+
+# ECDSA key size in bits for that certificate.
+k8s_scheduler_csr_key_size: "384"
+
+# Kubernetes: worker access, kubelet settings, and identity
+
+# Workers reach the API through the same HAProxy entry point as other clients.
+k8s_worker_api_endpoint_host: "{{ k8s_ctl_api_endpoint_host }}"
+
+# HAProxy frontend port used by worker clients.
+k8s_worker_api_endpoint_port: "{{ k8s_ctl_api_endpoint_port }}"
+
+# Kubelet command-line options, not the content of its YAML configuration file.
+# Use the WireGuard IP as the node address. An empty seccomp-default value emits
+# the flag without a value, enabling the runtime's default seccomp profile.
+k8s_worker_kubelet_settings:
+  config: "{{ k8s_worker_kubelet_conf_dir }}/kubelet-config.yaml"
+  node-ip: "{{ ansible_facts[k8s_interface]['ipv4']['address'] }}"
+  kubeconfig: "{{ k8s_worker_kubelet_conf_dir }}/kubeconfig"
+  seccomp-default: ""
+
+# Private-key algorithm for worker certificates generated by the CA role.
+k8s_worker_csr_key_algo: ecdsa
+
+# ECDSA key size in bits for worker certificates.
+k8s_worker_csr_key_size: "384"
+
+# Certificate authorities: etcd and the Kubernetes API
+
+# Common name identifying the CA that signs etcd server, peer, and client certs.
+ca_etcd_csr_cn: etcd
+
+# Private-key algorithm for the etcd certificate authority.
+ca_etcd_csr_key_algo: ecdsa
+
+# ECDSA key size in bits for the etcd CA.
+ca_etcd_csr_key_size: "384"
+
+# Common name identifying the CA that signs Kubernetes API/component certs.
+ca_k8s_apiserver_csr_cn: kubernetes
+
+# Private-key algorithm for the Kubernetes certificate authority.
+ca_k8s_apiserver_csr_key_algo: ecdsa
+
+# ECDSA key size in bits for the Kubernetes CA.
+ca_k8s_apiserver_csr_key_size: "384"
+
+# etcd: connectivity and election timing
+
+# Certificate source directory used when installing the etcd nodes.
+etcd_ca_conf_directory: "{{ k8s_ctl_ca_conf_directory }}"
+
+# Bind etcd communication to the encrypted cluster network.
+etcd_interface: "{{ k8s_interface }}"
+
+# Additional certificate subject alternative names for local etcd connections.
+etcd_cert_hosts: [localhost, 127.0.0.1]
+
+# Ask the CA role to create named etcd client certificates for these components.
+# The Cilium identity is generated even though this scenario disables its etcd
+# integration; the API server uses its client certificate to access etcd.
+etcd_additional_clients: [cilium, k8s-apiserver-etcd]
+
+# Override etcd timing in milliseconds: send heartbeats every 250 ms and start
+# an election after 2500 ms without leader contact. Keep the election timeout
+# comfortably above the heartbeat interval.
+etcd_settings_user:
+  heartbeat-interval: "250"
+  election-timeout: "2500"
+
+# etcd: server, peer, and client certificate identities
+
+# Common name for certificates used by etcd's client-facing TLS listener.
+etcd_server_csr_cn: etcd-server
+
+# Private-key algorithm for etcd server certificates.
+etcd_server_csr_key_algo: ecdsa
+
+# ECDSA key size in bits for etcd server certificates.
+etcd_server_csr_key_size: "384"
+
+# Common name for certificates used by etcd members to communicate with peers.
+etcd_peer_csr_cn: etcd-peer
+
+# Private-key algorithm for etcd peer certificates.
+etcd_peer_csr_key_algo: ecdsa
+
+# ECDSA key size in bits for etcd peer certificates.
+etcd_peer_csr_key_size: "384"
+
+# Common-name prefix used when generating etcd client certificates.
+etcd_client_csr_cn_prefix: etcd-client
+
+# Private-key algorithm for etcd client certificates.
+etcd_client_csr_key_algo: ecdsa
+
+# ECDSA key size in bits for etcd client certificates.
+etcd_client_csr_key_size: "384"
+
+# WireGuard: encrypted communication between the VMs
+
+# Per-host cluster IP and prefix, derived from the address table at the top.
+wireguard_address: "10.10.31.{{ coredns_test_addresses[inventory_hostname] }}/24"
+
+# Reachable private-network IP used to establish each VM's WireGuard tunnel.
+wireguard_endpoint: "172.16.31.{{ coredns_test_addresses[inventory_hostname] }}"
+
+# UDP port on which WireGuard peers exchange encrypted traffic.
+wireguard_port: 51820
+
+# Keepalive interval in seconds to keep peer mappings active.
+wireguard_persistent_keepalive: "30"
+
+# Cilium: pod networking required before CoreDNS can run
+
+# Install and manage Cilium from the assets VM.
+cilium_delegate_to: coredns-assets
+
+# Use Kubernetes-backed state rather than a separate Cilium etcd integration.
+# The dependency role expects the string "false" here.
+cilium_etcd_enabled: "false"
+
+# Directory containing this scenario's values.yml.j2 for the Cilium Helm chart.
+# This is not the CoreDNS chart-values template directory.
+cilium_chart_values_directory: "{{ lookup('ansible.builtin.env', 'MOLECULE_SCENARIO_DIRECTORY') }}/templates"
+
+# HAProxy: shared Kubernetes API entry point
+
+# Listen on each controller's WireGuard IPv4 address.
+haproxy_frontend_bind_address: "{{ ansible_facts[k8s_interface]['ipv4']['address'] }}"
+
+# Client-facing API port; must match k8s_ctl_api_endpoint_port above.
+haproxy_frontend_port: "16443"
+
+# Backend port where each kube-apiserver listens for HTTPS connections.
+haproxy_k8s_api_endpoint_port: "6443"
+
+# Container runtime and Helm tooling
+
+# Install the runc executable where the test nodes can find it.
+runc_bin_directory: /usr/local/sbin
+
+# Guest directory used to download and unpack containerd installation files.
+containerd_tmp_directory: /tmp/coredns-containerd
+
+# Pin Helm 3 for this scenario; the CoreDNS role does not certify Helm 4.
+helm_version: "3.19.5"

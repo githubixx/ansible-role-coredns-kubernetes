@@ -1,0 +1,92 @@
+---
+# Copyright (C) 2026 Robert Wimmer
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Locate chart workload and DNS service
+  ansible.builtin.set_fact:
+    coredns__deployments: "{{ coredns__manifest | selectattr('kind', 'equalto', 'Deployment') | list }}"
+    coredns__dns_services: >-
+      {{ coredns__manifest | selectattr('kind', 'equalto', 'Service')
+         | selectattr('spec.clusterIP', 'defined') | selectattr('spec.clusterIP', 'equalto', coredns_service_ip) | list }}
+  run_once: true
+
+- name: Require one owned deployment and DNS service
+  ansible.builtin.assert:
+    that:
+      - coredns__deployments | length == 1
+      - coredns__dns_services | length == 1
+      - coredns__manifest | selectattr('kind', 'equalto', 'ConfigMap') | list | length >= 1
+      - coredns__manifest | selectattr('kind', 'equalto', 'ServiceAccount') | list | length == 1
+      - coredns__manifest | selectattr('kind', 'equalto', 'ClusterRole') | list | length == 1
+      - coredns__manifest | selectattr('kind', 'equalto', 'ClusterRoleBinding') | list | length == 1
+    fail_msg: Unsupported chart resource shape; require chart-owned Deployment, DNS Service, configuration, and dedicated RBAC.
+  run_once: true
+
+- name: Record desired resource identities
+  ansible.builtin.set_fact:
+    coredns__deployment: "{{ coredns__deployments | first }}"
+    coredns__service: "{{ coredns__dns_services | first }}"
+  run_once: true
+
+- name: Validate rendered wiring
+  ansible.builtin.assert:
+    that:
+      - coredns__deployment.spec.template.spec.dnsPolicy in ['Default', 'None']
+      - coredns__deployment.spec.template.metadata.annotations['checksum/config'] | length == 64
+      - coredns__deployment.spec.template.spec.containers[0].readinessProbe.httpGet.path == '/ready'
+      - coredns__deployment.spec.template.spec.containers[0].livenessProbe.httpGet.path == '/health'
+      - coredns__service.spec.ports | selectattr('port', 'equalto', 53) | selectattr('protocol', 'equalto', 'UDP') | list | length == 1
+      - coredns__service.spec.ports | selectattr('port', 'equalto', 53) | selectattr('protocol', 'equalto', 'TCP') | list | length == 1
+      - coredns__service.spec.selector['app.kubernetes.io/instance'] == coredns_release_name
+      - coredns__deployment.spec.selector.matchLabels['app.kubernetes.io/instance'] == coredns_release_name
+      - coredns__deployment.spec.template.metadata.labels['app.kubernetes.io/instance'] == coredns_release_name
+      - coredns__deployment.metadata.annotations['githubixx.github.io/coredns-role'] == 'true'
+      - coredns__deployment.metadata.annotations['githubixx.github.io/cluster-domain'] == coredns_cluster_domain
+      - coredns__deployment.metadata.annotations['githubixx.github.io/probe-contract'] == coredns_forwarding_probes | to_json(sort_keys=true) | hash('sha256')
+      - coredns__service.spec.selector | dict2items | difference(coredns__deployment.spec.template.metadata.labels | dict2items) | length == 0
+      - coredns__deployment.spec.selector.matchLabels | dict2items | difference(coredns__deployment.spec.template.metadata.labels | dict2items) | length == 0
+      - coredns__deployment.spec.replicas | int >= 1
+      - coredns_allow_reduced_availability | bool or coredns__deployment.spec.replicas | int >= 2
+      - coredns_allow_reduced_availability | bool or coredns__deployment.spec.strategy.rollingUpdate.maxUnavailable | string in ['0', '0%']
+    fail_msg: Rendered DNS ports, release-scoped selectors, bootstrap DNS policy, checksum, or health probes are invalid.
+  run_once: true
+
+- name: Require removable chart-owned resources
+  ansible.builtin.assert:
+    that:
+      - item.metadata.get('annotations', {}).get('helm.sh/resource-policy', '') != 'keep'
+      - "'helm.sh/hook' not in item.metadata.get('annotations', {})"
+    fail_msg: "Resource retention or Helm hooks are unsupported for {{ item.kind }}/{{ item.metadata.name }}; guarded removal must not orphan live DNS."
+  loop: "{{ coredns__manifest }}"
+  loop_control:
+    label: "{{ item.kind }}/{{ item.metadata.name }}"
+
+- name: Require disruption protection unless reduced availability is acknowledged
+  when: not (coredns_allow_reduced_availability | bool)
+  ansible.builtin.assert:
+    that: coredns__manifest | selectattr('kind', 'equalto', 'PodDisruptionBudget') | list | length == 1
+    fail_msg: A protective PodDisruptionBudget is required unless reduced availability is acknowledged.
+  run_once: true
+
+- name: Require the PDB to select DNS pods and protect at least one replica
+  when: not (coredns_allow_reduced_availability | bool)
+  vars:
+    coredns__pdb_min: "{{ '' if item.spec.get('minAvailable') is none else item.spec.minAvailable | string }}"
+    coredns__pdb_max: "{{ '' if item.spec.get('maxUnavailable') is none else item.spec.maxUnavailable | string }}"
+    coredns__pdb_max_count: >-
+      {{ ((coredns__deployment.spec.replicas | int * (coredns__pdb_max[:-1] | int) / 100)
+          | round(0, 'ceil') | int) if coredns__pdb_max.endswith('%') else coredns__pdb_max | int }}
+  ansible.builtin.assert:
+    that:
+      - item.spec.selector.get('matchLabels', {}) | length > 0
+      - item.spec.selector.get('matchLabels', {}) | dict2items | difference(coredns__deployment.spec.template.metadata.labels | dict2items) | length == 0
+      - item.spec.selector.get('matchExpressions', []) | length == 0
+      - >-
+        (coredns__pdb_min is match('^[1-9][0-9]*%?$') and coredns__pdb_max == '')
+        or (coredns__pdb_min == '' and coredns__pdb_max is match('^(0|[1-9][0-9]*)%?$')
+            and coredns__pdb_max_count | int < coredns__deployment.spec.replicas | int)
+    fail_msg: The PDB must select DNS pods with matching labels and protect at least one replica, or acknowledge reduced availability.
+  loop: "{{ coredns__manifest | selectattr('kind', 'equalto', 'PodDisruptionBudget') | list }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  run_once: true

@@ -1,0 +1,147 @@
+---
+# Copyright (C) 2026 Robert Wimmer
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# Internal implementation data, not the public configuration interface.
+# Role vars outrank inventory/play vars; extra vars can still override them.
+# Keep these internal variables intact. Use the public defaults and chart
+# overrides in coredns_values_template/coredns_values for customization.
+
+# Complete lifecycle tag allowlist used for operation routing and validation.
+# This list is not a configurable set of enabled features.
+coredns__operation_tags:
+  - coredns_present
+  - coredns_template
+  - coredns_rollback
+  - coredns_absent
+
+# Initial Helm values, explicitly merged with the optional values template and
+# then coredns_values in tasks/values.yml. Later inputs win recursively; lists
+# replace. This merge allows supported customization without overriding this
+# internal variable. The resulting values must pass deployment safety checks.
+coredns__baseline:
+  # Persist the forwarding-probe contract in Helm history so recovery checks
+  # use the restored revision's probes rather than a rejected candidate's.
+  githubixxRole:
+    forwardingProbes: "{{ coredns_forwarding_probes }}"
+
+  # Identify role-owned resources and record the configured cluster DNS domain.
+  # Ownership validation relies on the management marker.
+  customAnnotations:
+    githubixx.github.io/coredns-role: "true"
+    githubixx.github.io/cluster-domain: "{{ coredns_cluster_domain }}"
+
+  # Keep chart resource names tied to the release and use the conventional
+  # kube-dns label expected for cluster DNS.
+  fullnameOverride: "{{ coredns_release_name }}"
+
+  k8sAppLabelOverride: kube-dns
+
+  # Enable the chart's cluster-DNS behavior; this must remain enabled.
+  isClusterService: true
+
+  # Make probe-only changes visible to Helm diff without changing the pod
+  # template or restarting DNS pods.
+  deployment:
+    annotations:
+      githubixx.github.io/probe-contract: "{{ coredns_forwarding_probes | to_json(sort_keys=true) | hash('sha256') }}"
+
+  # Stable cluster DNS Service identity. Its IP must match kubelet clusterDNS;
+  # changing an installed Service's name or IP requires a migration.
+  service:
+    name: kube-dns
+    clusterIP: "{{ coredns_service_ip }}"
+
+  # Availability baseline: two replicas, no unavailable replicas during rollout,
+  # and capacity for one extra pod. Reduced availability needs acknowledgement
+  # through coredns_allow_reduced_availability and explicit chart overrides.
+  replicaCount: 2
+
+  rollingUpdate:
+    maxUnavailable: 0
+    maxSurge: 1
+
+  # Protect at least one replica during voluntary evictions. A PDB does not
+  # protect against node failures or control Deployment rolling updates.
+  podDisruptionBudget:
+    minAvailable: 1
+
+  # Schedule DNS as a Kubernetes system-critical workload.
+  priorityClassName: system-cluster-critical
+
+  # Require chart-owned service-account and RBAC resources so lifecycle and
+  # rollback checks can validate the complete release.
+  serviceAccount:
+    create: true
+
+  rbac:
+    create: true
+
+  # Expose the metrics Service corresponding to the Corefile prometheus plugin.
+  prometheus:
+    service:
+      enabled: true
+
+  # Baseline scheduling requests and memory ceiling. Tune through
+  # coredns_values.resources for the cluster's DNS load and cache/API needs.
+  resources:
+    requests:
+      cpu: 100m
+      memory: 70Mi
+    limits:
+      memory: 170Mi
+
+  # Prefer replicas on different nodes without making separation mandatory.
+  # Labels match pods belonging to this release; spare capacity is still needed.
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            topologyKey: kubernetes.io/hostname
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/instance: "{{ coredns_release_name }}"
+                app.kubernetes.io/name: coredns
+
+  # Ordered Corefile servers and plugins rendered into the chart-owned
+  # ConfigMap. Overriding servers replaces this entire list, not one plugin.
+  servers:
+    - zones:
+        - zone: .
+          use_tcp: true
+      port: 53
+      plugins:
+        - name: errors
+
+        # Health includes a shutdown grace period; ready reports plugin readiness.
+        - name: health
+          configBlock: lameduck 10s
+        - name: ready
+
+        # Serve cluster and reverse records. "pods insecure" synthesizes pod-IP
+        # records without verifying pod objects; choose verified or disabled via
+        # a complete servers override if required by the cluster's trust model.
+        - name: kubernetes
+          parameters: "{{ coredns_cluster_domain }} in-addr.arpa ip6.arpa"
+          configBlock: |-
+            pods insecure
+            fallthrough in-addr.arpa ip6.arpa
+            ttl 30
+
+        # Publish Prometheus metrics independently of the DNS listener.
+        - name: prometheus
+          parameters: 0.0.0.0:9153
+
+        # Forward remaining queries to the public coredns_upstreams setting.
+        # Custom forwarding/TLS requires a template or chart values override.
+        - name: forward
+          parameters: ". {{ coredns_upstreams | join(' ') }}"
+
+        # Cache responses for up to 30 seconds and retain loop detection,
+        # configuration reloads, and answer-order load balancing.
+        - name: cache
+          parameters: "30"
+        - name: loop
+        - name: reload
+        - name: loadbalance

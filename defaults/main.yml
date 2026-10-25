@@ -1,0 +1,130 @@
+---
+# Copyright (C) 2026 Robert Wimmer
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# Pinned Helm chart version, not the CoreDNS application version.
+# Upgrades occur only when the requested chart version or values change.
+coredns_chart_version: "1.49.0"
+
+# Official CoreDNS chart repository URL, or a compatible mirror.
+coredns_chart_repository: "https://coredns.github.io/helm"
+
+# Helm release managed by this role. Existing releases must carry the role's
+# management marker; unrelated DNS installations are never adopted.
+coredns_release_name: coredns
+
+# Existing Kubernetes namespace for the release. The role does not create or
+# delete namespaces.
+coredns_namespace: kube-system
+
+# Required for deployment and template rendering: DNS Service IP matching every
+# kubelet's clusterDNS setting. No address is inferred or allocated by the role.
+# Changing an installed release's DNS Service IP requires a separate migration.
+coredns_service_ip: ""
+
+# Kubernetes DNS domain matching the kubelets' clusterDomain setting.
+coredns_cluster_domain: cluster.local
+
+# Inventory host executing Helm and Kubernetes modules without privilege
+# escalation. Its Python dependencies, Helm installation, and API access must
+# already be available.
+coredns_delegate_to: localhost
+
+# Kubeconfig path on the execution host. Defaults to K8S_AUTH_KUBECONFIG;
+# when empty, Helm and Kubernetes modules use their normal discovery behavior.
+coredns_kubeconfig: "{{ lookup('ansible.builtin.env', 'K8S_AUTH_KUBECONFIG') }}"
+
+# Optional kubeconfig context, defaulting to K8S_AUTH_CONTEXT.
+# An empty value leaves context selection to the kubeconfig.
+coredns_context: "{{ lookup('ansible.builtin.env', 'K8S_AUTH_CONTEXT') }}"
+
+# Helm 3 executable name or path on the execution host. Deployment also requires
+# a compatible helm-diff plugin; the role does not install either dependency.
+coredns_helm_binary: helm
+
+# Positive timeout in seconds for each bounded Helm operation or readiness
+# check, not a total time limit for the complete role execution.
+coredns_timeout: 300
+
+# Maximum retained Helm revisions for deployments; must be at least three.
+# Rollback requires a retained revision. Lowering this limit does not immediately
+# prune history; subsequent Helm mutations may prune older revisions.
+coredns_history_max: 10
+
+# Optional controller-side Jinja template producing a YAML values mapping.
+# Empty disables the template. Missing or invalid templates fail explicitly.
+# Template settings override the role's built-in chart settings described below.
+# coredns_values is applied last; lists replace rather than append.
+coredns_values_template: ""
+
+# The role supplies built-in Helm chart settings in vars/main.yml, including
+# two DNS replicas, rollout/disruption protection, CPU/memory requests and limits,
+# and DNS configuration for cluster records, upstream forwarding, and caching.
+# Use this mapping to change individual chart settings without copying them all.
+# Settings here override both the built-in settings and coredns_values_template.
+# Nested mappings retain unspecified entries. Lists replace rather than append,
+# including the entire servers list and its plugins.
+# Overrides must preserve the role's validated cluster-DNS and safety contracts.
+# Example: change only the memory limit from 170Mi to 256Mi, keeping CPU/memory
+# requests, replica count, DNS configuration, and all other settings unchanged:
+# coredns_values:
+#   resources:
+#     limits:
+#       memory: 256Mi
+coredns_values: {}
+
+# Upstream resolvers used by the role's built-in DNS forwarding configuration.
+# Override servers/plugins through chart values for custom forwarding or TLS.
+coredns_upstreams:
+  - "1.1.1.1"
+  - "9.9.9.9"
+
+# Explicitly acknowledge fewer than two replicas, nonzero rollout unavailability,
+# or missing/weakened PodDisruptionBudget protection. Does not change chart values
+# itself or bypass other deployment safety checks.
+coredns_allow_reduced_availability: false
+
+# Required acknowledgement with --tags coredns_absent to remove the owned release.
+# Setting this alone does not trigger removal.
+coredns_allow_removal: false
+
+# Positive retained Helm revision required with --tags coredns_rollback.
+# Zero is an unset sentinel; setting a revision alone does not trigger rollback.
+coredns_rollback_revision: 0
+
+# Rendered manifest output on the execution host for --tags coredns_template.
+# Parent directories are created as needed. Check mode predicts changes without
+# writing the file or its parent directories.
+coredns_template_path: "~/coredns/template.yml"
+
+# Before a changed deployment, test an isolated candidate release and its enabled
+# DNS probes. Requires extra cluster capacity. Candidate and temporary probe
+# resources are cleaned up on success or failure.
+coredns_preflight: false
+
+# Existing reachable pod containing dig for functional UDP/TCP DNS checks.
+# Empty disables functional DNS checks unless preflight creates a temporary
+# client. The execution identity needs permission to exec into probe pods.
+coredns_probe_pod: ""
+
+# Namespace containing the existing coredns_probe_pod.
+coredns_probe_namespace: default
+
+# Optional container name within the existing probe pod.
+# Empty leaves container selection to the Kubernetes API.
+coredns_probe_container: ""
+
+# Image containing dig for temporary DNS clients when preflight is enabled and
+# no existing probe pod is supplied. Must be pullable under the cluster's policy.
+coredns_probe_image: registry.k8s.io/e2e-test-images/agnhost:2.39
+
+# Opt-in forwarding checks over UDP and TCP; public DNS is never a default gate.
+# Requires coredns_preflight or an existing coredns_probe_pod.
+# Each entry supplies name, optional type (default A), and a nonempty expected
+# list of answer tokens. Supported types: A, AAAA, CNAME, MX, PTR, SRV, TXT.
+# Choose stable answers appropriate to your environment, for example:
+# coredns_forwarding_probes:
+#   - name: answer.example.test.
+#     type: A
+#     expected: ["192.0.2.42"]
+coredns_forwarding_probes: []
