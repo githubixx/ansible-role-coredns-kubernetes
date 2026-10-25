@@ -13,6 +13,23 @@ or distribution-managed DNS.
 The default chart is **1.49.0**, containing **CoreDNS 1.14.7**. Chart and application
 versions are distinct. Versions are pinned, never implicitly upgraded to latest.
 
+## Versions
+
+The role version follows [semantic versioning](https://semver.org/). Role fixes
+and features increase the version before `+`, even if the chart stays unchanged;
+for example, `0.1.1+1.49.0` would be a role patch release using the same chart.
+When the default chart changes, the suffix changes to match it. In SemVer, the
+suffix is build metadata and does not affect version precedence.
+
+- `0.1.0` is the version of this Ansible role.
+- `1.49.0` is the default CoreDNS Helm chart version, not the CoreDNS application
+  version.
+
+Use release tags for reproducible installations; the master branch may
+contain unreleased changes. See the [changelog](CHANGELOG.md) for release details.
+Overriding `coredns_chart_version` changes the chart deployed by your playbook,
+not the installed role's version.
+
 ## Requirements
 
 - ansible-core >= 2.19.
